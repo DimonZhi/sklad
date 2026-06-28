@@ -1,0 +1,7 @@
+[Unit]
+Description=Send Telegram alert for failed service %i
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sklad
+ExecStart=/usr/local/bin/python3 /opt/sklad/scripts/telegram_alert.py "Внимание: бот importcds сломался или остановился. Сервис: %i"

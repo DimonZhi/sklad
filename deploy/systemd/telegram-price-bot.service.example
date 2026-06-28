@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram MoySklad price converter bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sklad
+ExecStart=/usr/local/bin/python3 /opt/sklad/scripts/telegram_price_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

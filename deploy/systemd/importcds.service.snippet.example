@@ -1,0 +1,10 @@
+# Add this to the [Unit] section of your existing importcds.service:
+#
+# OnFailure=importcds-alert@%N.service
+#
+# Recommended [Service] settings for a bot process:
+#
+# Restart=always
+# RestartSec=5
+# StartLimitBurst=5
+# StartLimitIntervalSec=300

@@ -1,0 +1,18 @@
+[Unit]
+Description=importcds main Telegram bot
+After=network-online.target
+Wants=network-online.target
+OnFailure=importcds-alert@%N.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/importcds
+Environment=PRICE_BOT_PROJECT_DIR=/opt/sklad
+ExecStart=/opt/importcds/env/bin/python /opt/importcds/main_bot.py
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target
