@@ -1,9 +1,9 @@
-# Add this to the [Unit] section of your existing importcds.service:
+# Recommended [Service] settings for a bot process.
 #
-# OnFailure=importcds-alert@%N.service
+# ExecStopPost is used instead of OnFailure because Restart=always can restart
+# the service before the unit stays in failed state.
 #
-# Recommended [Service] settings for a bot process:
-#
+# ExecStopPost=%h/sklad/env/bin/python %h/sklad/scripts/systemd_failure_alert.py %n
 # Restart=always
 # RestartSec=5
 # StartLimitBurst=5

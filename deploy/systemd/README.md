@@ -12,7 +12,6 @@ If your paths differ, replace them in the unit files.
 ```bash
 sudo cp /opt/sklad/deploy/systemd/telegram-price-bot.service.example /etc/systemd/system/telegram-price-bot.service
 sudo cp /opt/sklad/deploy/systemd/importcds.service.example /etc/systemd/system/importcds.service
-sudo cp /opt/sklad/deploy/systemd/importcds-alert@.service.example /etc/systemd/system/importcds-alert@.service
 sudo systemctl daemon-reload
 ```
 
@@ -52,6 +51,6 @@ Simulate a hard crash of `importcds`:
 sudo systemctl kill -s SIGKILL importcds.service
 ```
 
-`systemd` should mark the service as failed, run `importcds-alert@importcds.service`, then restart `importcds`.
+`systemd` should run `ExecStopPost`, send the alert, then restart `importcds`.
 
-Do not use `systemctl stop importcds.service` for this test: a manual stop is not a failure and should not trigger `OnFailure`.
+Do not use `systemctl stop importcds.service` for this test: a manual stop has `SERVICE_RESULT=success`, so `systemd_failure_alert.py` skips the alert.
