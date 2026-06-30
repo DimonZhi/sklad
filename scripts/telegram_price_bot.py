@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import os
 import ssl
 import sys
 import time
+from calendar import monthrange
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -30,8 +34,17 @@ RESET_DISCOUNT_AFTER_UPDATE = True
 
 TIMEOUT_SECONDS = 60
 MAX_RETRIES = 4
+SEARCH_MONTHS_BACK = 6
+MAX_SEARCH_GROUPS = 20
 CONVERT_BUTTON = "Конвертировать цены в приемке"
+SEARCH_BUTTON = "Поиск по складу"
 DEFAULT_TELEGRAM_ACCESS_PASSWORD = "1821"
+DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD = "123"
+ROLE_ADMIN = "admin"
+ROLE_USER = "user"
+MATCH_THRESHOLD = 0.72
+TELEGRAM_MESSAGE_LIMIT = 3900
+TOKEN_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
 
 
 class BotError(RuntimeError):
@@ -50,6 +63,12 @@ class DialogState:
 
 
 @dataclass
+class AuthorizedUsers:
+    admins: set[int]
+    users: set[int]
+
+
+@dataclass
 class PriceUpdateResult:
     supply_name: str
     supply_id: str
@@ -58,6 +77,17 @@ class PriceUpdateResult:
     total_old_usd: Decimal
     total_new_rub: Decimal
     duplicate_count: int
+
+
+@dataclass
+class PurchaseOrderMatch:
+    album_name: str
+    order_name: str
+    moment: str
+    agent_name: str
+    quantity: Decimal
+    available_quantity: Decimal | None
+    score: float
 
 
 def env_flag(name: str) -> bool:
@@ -80,17 +110,11 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
-def load_authorized_chat_ids(path: Path) -> set[int]:
-    if not path.exists():
-        return set()
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise BotError(f"Cannot read authorized users file: {path}") from error
-
-    raw_ids = data.get("chat_ids", []) if isinstance(data, dict) else data
+def parse_chat_id_set(raw_ids: Any) -> set[int]:
     chat_ids: set[int] = set()
+    if not isinstance(raw_ids, list):
+        return chat_ids
+
     for raw_id in raw_ids:
         try:
             chat_ids.add(int(raw_id))
@@ -99,17 +123,58 @@ def load_authorized_chat_ids(path: Path) -> set[int]:
     return chat_ids
 
 
-def save_authorized_chat_ids(path: Path, chat_ids: set[int]) -> None:
+def load_authorized_users(path: Path) -> AuthorizedUsers:
+    if not path.exists():
+        return AuthorizedUsers(admins=set(), users=set())
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise BotError(f"Cannot read authorized users file: {path}") from error
+
+    if isinstance(data, dict):
+        admins = parse_chat_id_set(data.get("admins", []))
+        admins |= parse_chat_id_set(data.get("chat_ids", []))
+        users = parse_chat_id_set(data.get("users", []))
+    else:
+        admins = parse_chat_id_set(data)
+        users = set()
+
+    return AuthorizedUsers(admins=admins, users=users - admins)
+
+
+def load_authorized_chat_ids(path: Path) -> set[int]:
+    return load_authorized_users(path).admins
+
+
+def save_authorized_users(path: Path, authorized_users: AuthorizedUsers) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"chat_ids": sorted(chat_ids)}
+    admins = set(authorized_users.admins)
+    users = set(authorized_users.users) - admins
+    payload = {
+        "admins": sorted(admins),
+        "users": sorted(users),
+        "chat_ids": sorted(admins),
+    }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def add_authorized_chat_id(path: Path, chat_ids: set[int], chat_id: int) -> None:
-    if chat_id in chat_ids:
-        return
-    chat_ids.add(chat_id)
-    save_authorized_chat_ids(path, chat_ids)
+def add_authorized_chat_id(
+    path: Path,
+    authorized_users: AuthorizedUsers,
+    chat_id: int,
+    role: str,
+) -> None:
+    if role == ROLE_ADMIN:
+        authorized_users.admins.add(chat_id)
+        authorized_users.users.discard(chat_id)
+    elif role == ROLE_USER:
+        if chat_id not in authorized_users.admins:
+            authorized_users.users.add(chat_id)
+    else:
+        raise BotError(f"Unknown user role: {role}")
+
+    save_authorized_users(path, authorized_users)
 
 
 def create_ssl_context() -> ssl.SSLContext:
@@ -384,6 +449,347 @@ def update_supply_prices(
     )
 
 
+def subtract_months(moment: datetime, months: int) -> datetime:
+    year = moment.year
+    month = moment.month - months
+    while month <= 0:
+        month += 12
+        year -= 1
+
+    day = min(moment.day, monthrange(year, month)[1])
+    return moment.replace(
+        year=year,
+        month=month,
+        day=day,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+
+def format_moysklad_datetime(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_order_moment(value: Any) -> str:
+    text = str(value or "").strip()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    return text or "без даты"
+
+
+def format_quantity(value: Decimal) -> str:
+    text = format(value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def normalize_text(value: str) -> str:
+    tokens = TOKEN_RE.findall(value.lower().replace("ё", "е"))
+    return " ".join(tokens)
+
+
+def text_tokens(value: str) -> list[str]:
+    return TOKEN_RE.findall(value.lower().replace("ё", "е"))
+
+
+def token_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if len(left) >= 3 and len(right) >= 3 and (left in right or right in left):
+        return 0.92
+    return SequenceMatcher(None, left, right).ratio()
+
+
+def album_match_score(query: str, album_name: str) -> float:
+    query_tokens = text_tokens(query)
+    album_tokens = text_tokens(album_name)
+    if not query_tokens or not album_tokens:
+        return 0.0
+
+    best_scores: list[float] = []
+    for query_token in query_tokens:
+        best_scores.append(
+            max(token_similarity(query_token, album_token) for album_token in album_tokens)
+        )
+
+    if min(best_scores) < MATCH_THRESHOLD:
+        return 0.0
+
+    token_score = sum(best_scores) / len(best_scores)
+    sequence_score = SequenceMatcher(None, normalize_text(query), normalize_text(album_name)).ratio()
+    exact_bonus = 0.08 if all(score >= 0.98 for score in best_scores) else 0.0
+    return min(1.0, token_score * 0.86 + sequence_score * 0.14 + exact_bonus)
+
+
+def resolve_agent_name(
+    client: MoySkladClient,
+    order: dict[str, Any],
+    agent_cache: dict[str, str],
+) -> str:
+    agent = order.get("agent")
+    if not isinstance(agent, dict):
+        return "контрагент не указан"
+
+    name = agent.get("name")
+    if name:
+        return str(name)
+
+    meta = agent.get("meta")
+    if not isinstance(meta, dict):
+        return "контрагент не указан"
+
+    href = str(meta.get("href") or "")
+    if not href:
+        return "контрагент не указан"
+    if href not in agent_cache:
+        data = client.get(href)
+        agent_cache[href] = str(data.get("name") or "контрагент не указан")
+    return agent_cache[href]
+
+
+def to_optional_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def available_quantity_from_assortment(assortment: dict[str, Any]) -> Decimal | None:
+    quantity = to_optional_decimal(assortment.get("quantity"))
+    if quantity is not None:
+        return quantity
+
+    stock = to_optional_decimal(assortment.get("stock"))
+    reserve = to_optional_decimal(assortment.get("reserve"))
+    if stock is not None and reserve is not None:
+        return stock - reserve
+
+    return stock
+
+
+def available_quantity_from_stock_report(client: MoySkladClient, assortment_href: str) -> Decimal | None:
+    try:
+        data = client.get(
+            "/report/stock/all",
+            {"filter": f"assortment={assortment_href}", "limit": 100},
+        )
+    except MoySkladError:
+        return None
+
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        return None
+
+    total: Decimal | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        quantity = available_quantity_from_assortment(row)
+        if quantity is None:
+            continue
+        total = quantity if total is None else total + quantity
+    return total
+
+
+def resolve_assortment_available_quantity(
+    client: MoySkladClient,
+    assortment: dict[str, Any],
+    availability_cache: dict[str, Decimal | None],
+) -> Decimal | None:
+    available_quantity = available_quantity_from_assortment(assortment)
+    if available_quantity is not None:
+        return available_quantity
+
+    meta = assortment.get("meta")
+    if not isinstance(meta, dict):
+        return None
+
+    href = str(meta.get("href") or "")
+    if not href:
+        return None
+    if href not in availability_cache:
+        available_quantity = available_quantity_from_assortment(client.get(href))
+        if available_quantity is None:
+            available_quantity = available_quantity_from_stock_report(client, href)
+        availability_cache[href] = available_quantity
+    return availability_cache[href]
+
+
+def position_assortment(position: dict[str, Any]) -> dict[str, Any]:
+    assortment = position.get("assortment")
+    if not isinstance(assortment, dict):
+        return {}
+    return assortment
+
+
+def position_assortment_name(position: dict[str, Any]) -> str:
+    return str(position_assortment(position).get("name") or "").strip()
+
+
+def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseOrderMatch]:
+    query = query.strip()
+    if not query:
+        raise BotError("Введите название альбома для поиска.")
+
+    since = subtract_months(datetime.now(), SEARCH_MONTHS_BACK)
+    orders = iter_collection(
+        client,
+        "/entity/purchaseorder",
+        {
+            "filter": f"moment>={format_moysklad_datetime(since)};applicable=false",
+            "expand": "agent",
+            "limit": 100,
+            "order": "moment,desc",
+        },
+    )
+
+    agent_cache: dict[str, str] = {}
+    availability_cache: dict[str, Decimal | None] = {}
+    matches_by_key: dict[tuple[str, str, str, str], PurchaseOrderMatch] = {}
+
+    for order in orders:
+        order_id = str(order.get("id") or "")
+        if not order_id:
+            continue
+
+        order_name = str(order.get("name") or "без номера")
+        moment = format_order_moment(order.get("moment"))
+        agent_name = resolve_agent_name(client, order, agent_cache)
+        positions = iter_collection(
+            client,
+            f"/entity/purchaseorder/{order_id}/positions",
+            {"expand": "assortment", "limit": 1000},
+        )
+
+        for index, position in enumerate(positions, start=1):
+            assortment = position_assortment(position)
+            album_name = str(assortment.get("name") or "").strip()
+            score = album_match_score(query, album_name)
+            if score <= 0:
+                continue
+
+            available_quantity = resolve_assortment_available_quantity(
+                client,
+                assortment,
+                availability_cache,
+            )
+            quantity = to_decimal(
+                position.get("quantity", "0"),
+                f"количества позиции {index} в заказе {order_name}",
+            )
+            key = (album_name, order_name, moment, agent_name)
+            existing = matches_by_key.get(key)
+            if existing:
+                existing.quantity += quantity
+                if existing.available_quantity is None:
+                    existing.available_quantity = available_quantity
+                existing.score = max(existing.score, score)
+            else:
+                matches_by_key[key] = PurchaseOrderMatch(
+                    album_name=album_name,
+                    order_name=order_name,
+                    moment=moment,
+                    agent_name=agent_name,
+                    quantity=quantity,
+                    available_quantity=available_quantity,
+                    score=score,
+                )
+
+    return sorted(
+        matches_by_key.values(),
+        key=lambda match: (match.score, match.moment, match.album_name),
+        reverse=True,
+    )
+
+
+def format_purchase_order_matches(query: str, matches: list[PurchaseOrderMatch]) -> str:
+    if not matches:
+        return (
+            "Не нашел подходящих непроведенных заказов поставщикам "
+            f"за последние {SEARCH_MONTHS_BACK} месяцев по запросу: {query}"
+        )
+
+    groups: dict[str, list[PurchaseOrderMatch]] = {}
+    for match in matches:
+        groups.setdefault(match.album_name, []).append(match)
+
+    sorted_groups = sorted(
+        groups.items(),
+        key=lambda item: (max(match.score for match in item[1]), item[0].lower()),
+        reverse=True,
+    )
+
+    blocks: list[str] = []
+    for album_name, album_matches in sorted_groups[:MAX_SEARCH_GROUPS]:
+        available_quantity = next(
+            (
+                match.available_quantity
+                for match in album_matches
+                if match.available_quantity is not None
+            ),
+            None,
+        )
+        available_text = (
+            format_quantity(available_quantity)
+            if available_quantity is not None
+            else "неизвестно"
+        )
+        lines = [f"{album_name}, на склада - {available_text}, заказаны:"]
+        for match in sorted(album_matches, key=lambda item: item.moment, reverse=True):
+            lines.append(
+                f"{match.order_name}, {match.moment}, "
+                f"{match.agent_name}, {format_quantity(match.quantity)}"
+            )
+        blocks.append("\n".join(lines))
+
+    if len(sorted_groups) > MAX_SEARCH_GROUPS:
+        blocks.append(f"Показал первые {MAX_SEARCH_GROUPS} карточек из {len(sorted_groups)}.")
+
+    return "\n\n".join(blocks)
+
+
+def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        separator = "\n\n" if current else ""
+        if len(current) + len(separator) + len(block) <= limit:
+            current = f"{current}{separator}{block}"
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(block) <= limit:
+            current = block
+            continue
+
+        for line in block.splitlines():
+            line_separator = "\n" if current else ""
+            if len(current) + len(line_separator) + len(line) <= limit:
+                current = f"{current}{line_separator}{line}"
+            else:
+                if current:
+                    chunks.append(current)
+                while len(line) > limit:
+                    chunks.append(line[:limit])
+                    line = line[limit:]
+                current = line
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 class TelegramClient:
     def __init__(self, token: str, ssl_context: ssl.SSLContext) -> None:
         self.base_url = f"{TELEGRAM_API_BASE_URL}/bot{token}"
@@ -428,10 +834,29 @@ class TelegramClient:
             payload["reply_markup"] = reply_markup
         self.request("sendMessage", payload)
 
+    def send_long_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        chunks = split_telegram_text(text)
+        for index, chunk in enumerate(chunks):
+            self.send_message(
+                chat_id,
+                chunk,
+                reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            )
 
-def main_keyboard() -> dict[str, Any]:
+
+def main_keyboard(role: str) -> dict[str, Any]:
+    if role == ROLE_ADMIN:
+        keyboard = [[{"text": SEARCH_BUTTON}], [{"text": CONVERT_BUTTON}]]
+    else:
+        keyboard = [[{"text": SEARCH_BUTTON}]]
+
     return {
-        "keyboard": [[{"text": CONVERT_BUTTON}]],
+        "keyboard": keyboard,
         "resize_keyboard": True,
     }
 
@@ -446,12 +871,24 @@ def parse_allowed_chat_ids(raw_value: str) -> set[int]:
     return ids
 
 
+def get_authorized_role(
+    chat_id: int,
+    allowed_chat_ids: set[int],
+    authorized_users: AuthorizedUsers,
+) -> str | None:
+    if chat_id in allowed_chat_ids or chat_id in authorized_users.admins:
+        return ROLE_ADMIN
+    if chat_id in authorized_users.users:
+        return ROLE_USER
+    return None
+
+
 def is_authorized(
     chat_id: int,
     allowed_chat_ids: set[int],
-    authorized_chat_ids: set[int],
+    authorized_users: AuthorizedUsers,
 ) -> bool:
-    return chat_id in allowed_chat_ids or chat_id in authorized_chat_ids
+    return get_authorized_role(chat_id, allowed_chat_ids, authorized_users) is not None
 
 
 def result_message(result: PriceUpdateResult) -> str:
@@ -478,6 +915,7 @@ def handle_message(
     states: dict[int, DialogState],
     chat_id: int,
     text: str,
+    role: str,
 ) -> None:
     normalized_text = text.strip()
 
@@ -486,7 +924,7 @@ def handle_message(
         telegram.send_message(
             chat_id,
             "Выберите действие.",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(role),
         )
         return
 
@@ -495,11 +933,25 @@ def handle_message(
         telegram.send_message(
             chat_id,
             "Операция отменена.",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(role),
         )
         return
 
+    if normalized_text == SEARCH_BUTTON:
+        states[chat_id] = DialogState(step="search")
+        telegram.send_message(chat_id, "Введите название альбома для поиска.")
+        return
+
     if normalized_text == CONVERT_BUTTON:
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
         states[chat_id] = DialogState(step="supply")
         telegram.send_message(chat_id, "Введите номер приемки, например 28.")
         return
@@ -509,17 +961,53 @@ def handle_message(
         telegram.send_message(
             chat_id,
             "Нажмите кнопку, чтобы начать.",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(role),
         )
         return
 
+    if state.step == "search":
+        telegram.send_message(chat_id, "Ищу в заказах поставщикам...")
+        try:
+            matches = search_purchase_orders(moysklad, normalized_text)
+            message = format_purchase_order_matches(normalized_text, matches)
+        except (MoySkladError, BotError) as error:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                f"Не получилось выполнить поиск: {error}",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        states.pop(chat_id, None)
+        telegram.send_long_message(chat_id, message, reply_markup=main_keyboard(role))
+        return
+
     if state.step == "supply":
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
         state.supply_number = normalized_text
         state.step = "rate"
         telegram.send_message(chat_id, "Введите курс доллара, например 75.5.")
         return
 
     if state.step == "rate":
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
         try:
             rate = to_decimal(normalized_text, "курса доллара")
         except BotError as error:
@@ -538,6 +1026,15 @@ def handle_message(
         return
 
     if state.step == "delivery":
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
         try:
             delivery_price = to_decimal(normalized_text, "цены доставки")
         except BotError as error:
@@ -548,7 +1045,11 @@ def handle_message(
             return
         if state.supply_number is None or state.usd_to_rub_rate is None:
             states.pop(chat_id, None)
-            telegram.send_message(chat_id, "Диалог сброшен. Начните заново.", reply_markup=main_keyboard())
+            telegram.send_message(
+                chat_id,
+                "Диалог сброшен. Начните заново.",
+                reply_markup=main_keyboard(role),
+            )
             return
 
         telegram.send_message(chat_id, "Начинаю обновление цен в МойСклад...")
@@ -564,16 +1065,24 @@ def handle_message(
             telegram.send_message(
                 chat_id,
                 f"Не получилось обновить цены: {error}",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard(role),
             )
             return
 
         states.pop(chat_id, None)
-        telegram.send_message(chat_id, result_message(result), reply_markup=main_keyboard())
+        telegram.send_message(
+            chat_id,
+            result_message(result),
+            reply_markup=main_keyboard(role),
+        )
         return
 
     states.pop(chat_id, None)
-    telegram.send_message(chat_id, "Диалог сброшен. Начните заново.", reply_markup=main_keyboard())
+    telegram.send_message(
+        chat_id,
+        "Диалог сброшен. Начните заново.",
+        reply_markup=main_keyboard(role),
+    )
 
 
 def main() -> int:
@@ -587,6 +1096,10 @@ def main() -> int:
         "TELEGRAM_ACCESS_PASSWORD",
         DEFAULT_TELEGRAM_ACCESS_PASSWORD,
     ).strip()
+    user_access_password = os.environ.get(
+        "TELEGRAM_USER_ACCESS_PASSWORD",
+        DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD,
+    ).strip()
 
     if not telegram_token:
         print("Fill TELEGRAM_BOT_TOKEN in .env first", file=sys.stderr)
@@ -597,11 +1110,14 @@ def main() -> int:
     if not access_password:
         print("Fill TELEGRAM_ACCESS_PASSWORD in .env first", file=sys.stderr)
         return 1
+    if not user_access_password:
+        print("Fill TELEGRAM_USER_ACCESS_PASSWORD in .env first", file=sys.stderr)
+        return 1
 
     ssl_context = create_ssl_context()
     telegram = TelegramClient(telegram_token, ssl_context)
     moysklad = MoySkladClient(moysklad_token, moysklad_base_url, ssl_context)
-    authorized_chat_ids = load_authorized_chat_ids(AUTHORIZED_USERS_PATH)
+    authorized_users = load_authorized_users(AUTHORIZED_USERS_PATH)
     states: dict[int, DialogState] = {}
     offset: int | None = None
 
@@ -622,13 +1138,31 @@ def main() -> int:
                     telegram.send_message(chat_id, f"Ваш chat id: {chat_id}")
                     continue
 
-                if not is_authorized(chat_id, allowed_chat_ids, authorized_chat_ids):
+                role = get_authorized_role(chat_id, allowed_chat_ids, authorized_users)
+                if role is None:
                     if text.strip() == access_password:
-                        add_authorized_chat_id(AUTHORIZED_USERS_PATH, authorized_chat_ids, chat_id)
+                        add_authorized_chat_id(
+                            AUTHORIZED_USERS_PATH,
+                            authorized_users,
+                            chat_id,
+                            ROLE_ADMIN,
+                        )
+                        telegram.send_message(
+                            chat_id,
+                            "Доступ открыт: админ.",
+                            reply_markup=main_keyboard(ROLE_ADMIN),
+                        )
+                    elif text.strip() == user_access_password:
+                        add_authorized_chat_id(
+                            AUTHORIZED_USERS_PATH,
+                            authorized_users,
+                            chat_id,
+                            ROLE_USER,
+                        )
                         telegram.send_message(
                             chat_id,
                             "Доступ открыт.",
-                            reply_markup=main_keyboard(),
+                            reply_markup=main_keyboard(ROLE_USER),
                         )
                     elif text.strip() in {"/start", "/help"}:
                         telegram.send_message(chat_id, "Введите пароль для доступа.")
@@ -636,7 +1170,7 @@ def main() -> int:
                         telegram.send_message(chat_id, "Неверный пароль. Попробуйте еще раз.")
                     continue
 
-                handle_message(telegram, moysklad, states, chat_id, text)
+                handle_message(telegram, moysklad, states, chat_id, text, role)
         except KeyboardInterrupt:
             print("Bot stopped.")
             return 0
