@@ -36,8 +36,7 @@ TIMEOUT_SECONDS = 60
 MAX_RETRIES = 4
 SEARCH_MONTHS_BACK = 6
 MAX_SEARCH_GROUPS = 20
-ASSORTMENT_SEARCH_LIMIT = 100
-MAX_ASSORTMENT_SEARCH_TERMS = 6
+ASSORTMENT_CACHE_SECONDS = 8 * 60 * 60
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
 DEFAULT_TELEGRAM_ACCESS_PASSWORD = "1821"
@@ -103,6 +102,22 @@ class AssortmentCandidate:
     href: str
     available_quantity: Decimal | None
     score: float
+
+
+@dataclass
+class AssortmentCard:
+    name: str
+    href: str
+    available_quantity: Decimal | None
+
+
+@dataclass
+class AssortmentCache:
+    loaded_at: float
+    cards: list[AssortmentCard]
+
+
+_assortment_cache: AssortmentCache | None = None
 
 
 def env_flag(name: str) -> bool:
@@ -381,18 +396,6 @@ def iter_collection(
             return rows
 
 
-def get_collection_page(
-    client: MoySkladClient,
-    path: str,
-    params: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    data = client.get(path, params)
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        raise MoySkladError(f"Expected collection response for {path}")
-    return rows
-
-
 def find_supply(client: MoySkladClient, supply_number: str) -> tuple[dict[str, Any], int]:
     rows_by_id: dict[str, dict[str, Any]] = {}
     for candidate in supply_number_candidates(supply_number):
@@ -649,61 +652,67 @@ def resolve_assortment_available_quantity(
 
 def assortment_href(assortment: dict[str, Any]) -> str:
     meta = assortment.get("meta")
-    if not isinstance(meta, dict):
-        return ""
-    return str(meta.get("href") or "")
+    if isinstance(meta, dict):
+        href = str(meta.get("href") or "")
+        if href:
+            return href
+    return str(assortment.get("href") or "")
 
 
-def assortment_search_terms(query: str) -> list[str]:
-    terms: list[str] = []
-    normalized_query = query.strip()
-    if normalized_query:
-        terms.append(normalized_query)
+def load_assortment_cards(client: MoySkladClient) -> list[AssortmentCard]:
+    global _assortment_cache
 
-    tokens = sorted(set(text_tokens(query)), key=lambda token: (-len(token), token))
-    for token in tokens:
-        if len(token) < 2 or token in terms:
+    now = time.time()
+    if (
+        _assortment_cache is not None
+        and now - _assortment_cache.loaded_at < ASSORTMENT_CACHE_SECONDS
+    ):
+        return _assortment_cache.cards
+
+    rows = iter_collection(client, "/entity/assortment", {"limit": 1000})
+    cards: list[AssortmentCard] = []
+    for row in rows:
+        name = str(row.get("name") or "").strip()
+        href = assortment_href(row)
+        if not name or not href:
             continue
-        terms.append(token)
-        if len(terms) >= MAX_ASSORTMENT_SEARCH_TERMS:
-            break
+        cards.append(
+            AssortmentCard(
+                name=name,
+                href=href,
+                available_quantity=available_quantity_from_assortment(row),
+            )
+        )
 
-    return terms
+    _assortment_cache = AssortmentCache(loaded_at=now, cards=cards)
+    return cards
 
 
 def search_assortment_cards(client: MoySkladClient, query: str) -> list[AssortmentCandidate]:
     availability_cache: dict[str, Decimal | None] = {}
-    rows_by_href: dict[str, dict[str, Any]] = {}
-
-    for term in assortment_search_terms(query):
-        rows = get_collection_page(
-            client,
-            "/entity/assortment",
-            {"search": term, "limit": ASSORTMENT_SEARCH_LIMIT},
-        )
-        for row in rows:
-            href = assortment_href(row)
-            name = str(row.get("name") or "").strip()
-            key = href or name
-            if key:
-                rows_by_href[key] = row
 
     candidates: list[AssortmentCandidate] = []
-    for row in rows_by_href.values():
-        name = str(row.get("name") or "").strip()
-        href = assortment_href(row)
-        score = album_match_score(query, name)
-        if not href or score <= 0:
+    for card in load_assortment_cards(client):
+        score = album_match_score(query, card.name)
+        if score <= 0:
             continue
+
+        available_quantity = card.available_quantity
+        if available_quantity is None and card.href not in availability_cache:
+            product = client.get(card.href)
+            available_quantity = available_quantity_from_assortment(product)
+            if available_quantity is None:
+                available_quantity = available_quantity_from_stock_report(client, card.href)
+            availability_cache[card.href] = available_quantity
 
         candidates.append(
             AssortmentCandidate(
-                name=name,
-                href=href,
-                available_quantity=resolve_assortment_available_quantity(
-                    client,
-                    row,
-                    availability_cache,
+                name=card.name,
+                href=card.href,
+                available_quantity=(
+                    available_quantity
+                    if available_quantity is not None
+                    else availability_cache.get(card.href)
                 ),
                 score=score,
             )
