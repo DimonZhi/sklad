@@ -36,12 +36,15 @@ TIMEOUT_SECONDS = 60
 MAX_RETRIES = 4
 SEARCH_MONTHS_BACK = 6
 MAX_SEARCH_GROUPS = 20
+ASSORTMENT_SEARCH_LIMIT = 100
+MAX_ASSORTMENT_SEARCH_TERMS = 6
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
 DEFAULT_TELEGRAM_ACCESS_PASSWORD = "1821"
 DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD = "123"
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
+VINYL_NOT_FOUND_MESSAGE = "Винил не найден."
 MATCH_THRESHOLD = 0.72
 TELEGRAM_MESSAGE_LIMIT = 3900
 TOKEN_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
@@ -52,6 +55,10 @@ class BotError(RuntimeError):
 
 
 class MoySkladError(RuntimeError):
+    pass
+
+
+class VinylNotFound(BotError):
     pass
 
 
@@ -86,6 +93,14 @@ class PurchaseOrderMatch:
     moment: str
     agent_name: str
     quantity: Decimal
+    available_quantity: Decimal | None
+    score: float
+
+
+@dataclass
+class AssortmentCandidate:
+    name: str
+    href: str
     available_quantity: Decimal | None
     score: float
 
@@ -366,6 +381,18 @@ def iter_collection(
             return rows
 
 
+def get_collection_page(
+    client: MoySkladClient,
+    path: str,
+    params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    data = client.get(path, params)
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        raise MoySkladError(f"Expected collection response for {path}")
+    return rows
+
+
 def find_supply(client: MoySkladClient, supply_number: str) -> tuple[dict[str, Any], int]:
     rows_by_id: dict[str, dict[str, Any]] = {}
     for candidate in supply_number_candidates(supply_number):
@@ -620,6 +647,75 @@ def resolve_assortment_available_quantity(
     return availability_cache[href]
 
 
+def assortment_href(assortment: dict[str, Any]) -> str:
+    meta = assortment.get("meta")
+    if not isinstance(meta, dict):
+        return ""
+    return str(meta.get("href") or "")
+
+
+def assortment_search_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    normalized_query = query.strip()
+    if normalized_query:
+        terms.append(normalized_query)
+
+    tokens = sorted(set(text_tokens(query)), key=lambda token: (-len(token), token))
+    for token in tokens:
+        if len(token) < 2 or token in terms:
+            continue
+        terms.append(token)
+        if len(terms) >= MAX_ASSORTMENT_SEARCH_TERMS:
+            break
+
+    return terms
+
+
+def search_assortment_cards(client: MoySkladClient, query: str) -> list[AssortmentCandidate]:
+    availability_cache: dict[str, Decimal | None] = {}
+    rows_by_href: dict[str, dict[str, Any]] = {}
+
+    for term in assortment_search_terms(query):
+        rows = get_collection_page(
+            client,
+            "/entity/assortment",
+            {"search": term, "limit": ASSORTMENT_SEARCH_LIMIT},
+        )
+        for row in rows:
+            href = assortment_href(row)
+            name = str(row.get("name") or "").strip()
+            key = href or name
+            if key:
+                rows_by_href[key] = row
+
+    candidates: list[AssortmentCandidate] = []
+    for row in rows_by_href.values():
+        name = str(row.get("name") or "").strip()
+        href = assortment_href(row)
+        score = album_match_score(query, name)
+        if not href or score <= 0:
+            continue
+
+        candidates.append(
+            AssortmentCandidate(
+                name=name,
+                href=href,
+                available_quantity=resolve_assortment_available_quantity(
+                    client,
+                    row,
+                    availability_cache,
+                ),
+                score=score,
+            )
+        )
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (candidate.score, candidate.name.lower()),
+        reverse=True,
+    )
+
+
 def position_assortment(position: dict[str, Any]) -> dict[str, Any]:
     assortment = position.get("assortment")
     if not isinstance(assortment, dict):
@@ -627,15 +723,16 @@ def position_assortment(position: dict[str, Any]) -> dict[str, Any]:
     return assortment
 
 
-def position_assortment_name(position: dict[str, Any]) -> str:
-    return str(position_assortment(position).get("name") or "").strip()
-
-
 def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseOrderMatch]:
     query = query.strip()
     if not query:
         raise BotError("Введите название альбома для поиска.")
 
+    candidates = search_assortment_cards(client, query)
+    if not candidates:
+        raise VinylNotFound(VINYL_NOT_FOUND_MESSAGE)
+
+    candidates_by_href = {candidate.href: candidate for candidate in candidates}
     since = subtract_months(datetime.now(), SEARCH_MONTHS_BACK)
     orders = iter_collection(
         client,
@@ -649,7 +746,6 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
     )
 
     agent_cache: dict[str, str] = {}
-    availability_cache: dict[str, Decimal | None] = {}
     matches_by_key: dict[tuple[str, str, str, str], PurchaseOrderMatch] = {}
 
     for order in orders:
@@ -668,36 +764,31 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
 
         for index, position in enumerate(positions, start=1):
             assortment = position_assortment(position)
-            album_name = str(assortment.get("name") or "").strip()
-            score = album_match_score(query, album_name)
-            if score <= 0:
+            href = assortment_href(assortment)
+            candidate = candidates_by_href.get(href)
+            if candidate is None:
                 continue
 
-            available_quantity = resolve_assortment_available_quantity(
-                client,
-                assortment,
-                availability_cache,
-            )
             quantity = to_decimal(
                 position.get("quantity", "0"),
                 f"количества позиции {index} в заказе {order_name}",
             )
-            key = (album_name, order_name, moment, agent_name)
+            key = (candidate.name, order_name, moment, agent_name)
             existing = matches_by_key.get(key)
             if existing:
                 existing.quantity += quantity
                 if existing.available_quantity is None:
-                    existing.available_quantity = available_quantity
-                existing.score = max(existing.score, score)
+                    existing.available_quantity = candidate.available_quantity
+                existing.score = max(existing.score, candidate.score)
             else:
                 matches_by_key[key] = PurchaseOrderMatch(
-                    album_name=album_name,
+                    album_name=candidate.name,
                     order_name=order_name,
                     moment=moment,
                     agent_name=agent_name,
                     quantity=quantity,
-                    available_quantity=available_quantity,
-                    score=score,
+                    available_quantity=candidate.available_quantity,
+                    score=candidate.score,
                 )
 
     return sorted(
@@ -970,6 +1061,14 @@ def handle_message(
         try:
             matches = search_purchase_orders(moysklad, normalized_text)
             message = format_purchase_order_matches(normalized_text, matches)
+        except VinylNotFound as error:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                str(error),
+                reply_markup=main_keyboard(role),
+            )
+            return
         except (MoySkladError, BotError) as error:
             states.pop(chat_id, None)
             telegram.send_message(
