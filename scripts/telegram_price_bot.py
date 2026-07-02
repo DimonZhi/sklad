@@ -9,6 +9,7 @@ import ssl
 import sys
 import time
 from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -36,6 +37,8 @@ TIMEOUT_SECONDS = 60
 MAX_RETRIES = 4
 SEARCH_MONTHS_BACK = 6
 MAX_SEARCH_GROUPS = 20
+MAX_SEARCH_CANDIDATES = 30
+MAX_SEARCH_WORKERS = 6
 ASSORTMENT_CACHE_SECONDS = 8 * 60 * 60
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
@@ -528,8 +531,10 @@ def text_tokens(value: str) -> list[str]:
 def token_similarity(left: str, right: str) -> float:
     if left == right:
         return 1.0
-    if len(left) >= 3 and len(right) >= 3 and (left in right or right in left):
+    if len(left) >= 4 and left in right and len(right) / len(left) <= 2:
         return 0.92
+    if len(left) >= 4 and (left[0] != right[0] or left[-1] != right[-1]):
+        return 0.0
     return SequenceMatcher(None, left, right).ratio()
 
 
@@ -732,6 +737,44 @@ def position_assortment(position: dict[str, Any]) -> dict[str, Any]:
     return assortment
 
 
+def purchase_order_positions(
+    client: MoySkladClient,
+    order: dict[str, Any],
+    order_id: str,
+) -> list[dict[str, Any]]:
+    positions = order.get("positions")
+    if isinstance(positions, dict):
+        rows = positions.get("rows")
+        meta = positions.get("meta") if isinstance(positions.get("meta"), dict) else {}
+        size = meta.get("size")
+        if isinstance(rows, list) and (not isinstance(size, int) or len(rows) >= size):
+            return rows
+
+    return iter_collection(
+        client,
+        f"/entity/purchaseorder/{order_id}/positions",
+        {"expand": "assortment", "limit": 1000},
+    )
+
+
+def find_purchase_orders_for_candidate(
+    client: MoySkladClient,
+    base_filter: str,
+    candidate: AssortmentCandidate,
+) -> tuple[AssortmentCandidate, list[dict[str, Any]]]:
+    orders = iter_collection(
+        client,
+        "/entity/purchaseorder",
+        {
+            "filter": f"{base_filter};assortment={candidate.href}",
+            "expand": "agent,positions.assortment",
+            "limit": 100,
+            "order": "moment,desc",
+        },
+    )
+    return candidate, orders
+
+
 def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseOrderMatch]:
     query = query.strip()
     if not query:
@@ -741,64 +784,59 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
     if not candidates:
         raise VinylNotFound(VINYL_NOT_FOUND_MESSAGE)
 
-    candidates_by_href = {candidate.href: candidate for candidate in candidates}
     since = subtract_months(datetime.now(), SEARCH_MONTHS_BACK)
-    orders = iter_collection(
-        client,
-        "/entity/purchaseorder",
-        {
-            "filter": f"moment>={format_moysklad_datetime(since)};applicable=false",
-            "expand": "agent",
-            "limit": 100,
-            "order": "moment,desc",
-        },
-    )
-
+    base_filter = f"moment>={format_moysklad_datetime(since)};applicable=false"
     agent_cache: dict[str, str] = {}
     matches_by_key: dict[tuple[str, str, str, str], PurchaseOrderMatch] = {}
+    limited_candidates = candidates[:MAX_SEARCH_CANDIDATES]
 
-    for order in orders:
-        order_id = str(order.get("id") or "")
-        if not order_id:
-            continue
+    workers = min(MAX_SEARCH_WORKERS, len(limited_candidates))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(find_purchase_orders_for_candidate, client, base_filter, candidate)
+            for candidate in limited_candidates
+        ]
+        candidate_orders = [future.result() for future in as_completed(futures)]
 
-        order_name = str(order.get("name") or "без номера")
-        moment = format_order_moment(order.get("moment"))
-        agent_name = resolve_agent_name(client, order, agent_cache)
-        positions = iter_collection(
-            client,
-            f"/entity/purchaseorder/{order_id}/positions",
-            {"expand": "assortment", "limit": 1000},
-        )
-
-        for index, position in enumerate(positions, start=1):
-            assortment = position_assortment(position)
-            href = assortment_href(assortment)
-            candidate = candidates_by_href.get(href)
-            if candidate is None:
+    for candidate, orders in candidate_orders:
+        for order in orders:
+            order_id = str(order.get("id") or "")
+            if not order_id:
                 continue
 
-            quantity = to_decimal(
-                position.get("quantity", "0"),
-                f"количества позиции {index} в заказе {order_name}",
-            )
-            key = (candidate.name, order_name, moment, agent_name)
-            existing = matches_by_key.get(key)
-            if existing:
-                existing.quantity += quantity
-                if existing.available_quantity is None:
-                    existing.available_quantity = candidate.available_quantity
-                existing.score = max(existing.score, candidate.score)
-            else:
-                matches_by_key[key] = PurchaseOrderMatch(
-                    album_name=candidate.name,
-                    order_name=order_name,
-                    moment=moment,
-                    agent_name=agent_name,
-                    quantity=quantity,
-                    available_quantity=candidate.available_quantity,
-                    score=candidate.score,
+            order_name = str(order.get("name") or "без номера")
+            moment = format_order_moment(order.get("moment"))
+            agent_name = resolve_agent_name(client, order, agent_cache)
+
+            for index, position in enumerate(
+                purchase_order_positions(client, order, order_id),
+                start=1,
+            ):
+                assortment = position_assortment(position)
+                if assortment_href(assortment) != candidate.href:
+                    continue
+
+                quantity = to_decimal(
+                    position.get("quantity", "0"),
+                    f"количества позиции {index} в заказе {order_name}",
                 )
+                key = (candidate.name, order_name, moment, agent_name)
+                existing = matches_by_key.get(key)
+                if existing:
+                    existing.quantity += quantity
+                    if existing.available_quantity is None:
+                        existing.available_quantity = candidate.available_quantity
+                    existing.score = max(existing.score, candidate.score)
+                else:
+                    matches_by_key[key] = PurchaseOrderMatch(
+                        album_name=candidate.name,
+                        order_name=order_name,
+                        moment=moment,
+                        agent_name=agent_name,
+                        quantity=quantity,
+                        available_quantity=candidate.available_quantity,
+                        score=candidate.score,
+                    )
 
     return sorted(
         matches_by_key.values(),
