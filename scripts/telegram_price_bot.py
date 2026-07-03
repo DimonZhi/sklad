@@ -47,6 +47,7 @@ DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD = "123"
 ROLE_ADMIN = "admin"
 ROLE_USER = "user"
 VINYL_NOT_FOUND_MESSAGE = "Винил не найден."
+IGNORED_PURCHASE_ORDER_AGENTS = ("сергей асатрян", "сергей астарян")
 MATCH_THRESHOLD = 0.72
 TELEGRAM_MESSAGE_LIMIT = 3900
 TOKEN_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
@@ -97,6 +98,12 @@ class PurchaseOrderMatch:
     quantity: Decimal
     available_quantity: Decimal | None
     score: float
+
+
+@dataclass
+class AlbumSearchResult:
+    candidates: list["AssortmentCandidate"]
+    matches: list[PurchaseOrderMatch]
 
 
 @dataclass
@@ -524,6 +531,11 @@ def normalize_text(value: str) -> str:
     return " ".join(tokens)
 
 
+def is_ignored_purchase_order_agent(agent_name: str) -> bool:
+    normalized_agent = normalize_text(agent_name)
+    return any(ignored in normalized_agent for ignored in IGNORED_PURCHASE_ORDER_AGENTS)
+
+
 def text_tokens(value: str) -> list[str]:
     return TOKEN_RE.findall(value.lower().replace("ё", "е"))
 
@@ -775,7 +787,7 @@ def find_purchase_orders_for_candidate(
     return candidate, orders
 
 
-def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseOrderMatch]:
+def search_purchase_orders(client: MoySkladClient, query: str) -> AlbumSearchResult:
     query = query.strip()
     if not query:
         raise BotError("Введите название альбома для поиска.")
@@ -784,11 +796,11 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
     if not candidates:
         raise VinylNotFound(VINYL_NOT_FOUND_MESSAGE)
 
+    limited_candidates = candidates[:MAX_SEARCH_CANDIDATES]
     since = subtract_months(datetime.now(), SEARCH_MONTHS_BACK)
-    base_filter = f"moment>={format_moysklad_datetime(since)};applicable=false"
+    base_filter = f"moment>={format_moysklad_datetime(since)};applicable=true"
     agent_cache: dict[str, str] = {}
     matches_by_key: dict[tuple[str, str, str, str], PurchaseOrderMatch] = {}
-    limited_candidates = candidates[:MAX_SEARCH_CANDIDATES]
 
     workers = min(MAX_SEARCH_WORKERS, len(limited_candidates))
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -807,6 +819,8 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
             order_name = str(order.get("name") or "без номера")
             moment = format_order_moment(order.get("moment"))
             agent_name = resolve_agent_name(client, order, agent_cache)
+            if is_ignored_purchase_order_agent(agent_name):
+                continue
 
             for index, position in enumerate(
                 purchase_order_positions(client, order, order_id),
@@ -838,46 +852,41 @@ def search_purchase_orders(client: MoySkladClient, query: str) -> list[PurchaseO
                         score=candidate.score,
                     )
 
-    return sorted(
-        matches_by_key.values(),
-        key=lambda match: (match.score, match.moment, match.album_name),
-        reverse=True,
+    return AlbumSearchResult(
+        candidates=limited_candidates,
+        matches=sorted(
+            matches_by_key.values(),
+            key=lambda match: (match.score, match.moment, match.album_name),
+            reverse=True,
+        ),
     )
 
 
-def format_purchase_order_matches(query: str, matches: list[PurchaseOrderMatch]) -> str:
-    if not matches:
+def format_purchase_order_matches(query: str, result: AlbumSearchResult) -> str:
+    if not result.candidates:
         return (
-            "Не нашел подходящих непроведенных заказов поставщикам "
+            "Не нашел подходящих карточек "
             f"за последние {SEARCH_MONTHS_BACK} месяцев по запросу: {query}"
         )
 
     groups: dict[str, list[PurchaseOrderMatch]] = {}
-    for match in matches:
+    for match in result.matches:
         groups.setdefault(match.album_name, []).append(match)
 
-    sorted_groups = sorted(
-        groups.items(),
-        key=lambda item: (max(match.score for match in item[1]), item[0].lower()),
-        reverse=True,
-    )
-
     blocks: list[str] = []
-    for album_name, album_matches in sorted_groups[:MAX_SEARCH_GROUPS]:
-        available_quantity = next(
-            (
-                match.available_quantity
-                for match in album_matches
-                if match.available_quantity is not None
-            ),
-            None,
-        )
+    for candidate in result.candidates[:MAX_SEARCH_GROUPS]:
+        album_matches = groups.get(candidate.name, [])
+        available_quantity = candidate.available_quantity
         available_text = (
             format_quantity(available_quantity)
             if available_quantity is not None
             else "неизвестно"
         )
-        lines = [f"{album_name}, на склада - {available_text}, заказаны:"]
+        if not album_matches:
+            blocks.append(f"{candidate.name}, на складе - {available_text}")
+            continue
+
+        lines = [f"{candidate.name}, на складе - {available_text}, заказаны:"]
         for match in sorted(album_matches, key=lambda item: item.moment, reverse=True):
             lines.append(
                 f"{match.order_name}, {match.moment}, "
@@ -885,8 +894,8 @@ def format_purchase_order_matches(query: str, matches: list[PurchaseOrderMatch])
             )
         blocks.append("\n".join(lines))
 
-    if len(sorted_groups) > MAX_SEARCH_GROUPS:
-        blocks.append(f"Показал первые {MAX_SEARCH_GROUPS} карточек из {len(sorted_groups)}.")
+    if len(result.candidates) > MAX_SEARCH_GROUPS:
+        blocks.append(f"Показал первые {MAX_SEARCH_GROUPS} карточек из {len(result.candidates)}.")
 
     return "\n\n".join(blocks)
 
