@@ -43,7 +43,6 @@ ASSORTMENT_CACHE_SECONDS = 8 * 60 * 60
 REPORT_SOLD_MONTHS_BACK = 12
 REPORT_NOT_ORDERED_MONTHS_BACK = 2
 REPORT_MIN_SOLD_QUANTITY = Decimal("2")
-REPORT_MAX_WORKERS = 6
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
 REPORT_BUTTON = "Отчет по закупкам"
@@ -921,64 +920,50 @@ def format_purchase_order_matches(query: str, result: AlbumSearchResult) -> str:
     return "\n\n".join(blocks)
 
 
-def sold_quantity_for_assortment(
-    client: MoySkladClient,
-    base_filter: str,
-    href: str,
-) -> Decimal:
-    documents = iter_collection(
+def load_sold_quantity_by_href(client: MoySkladClient, months_back: int) -> dict[str, Decimal]:
+    since = subtract_months(datetime.now(), months_back)
+    rows = iter_collection(
         client,
-        "/entity/demand",
+        "/report/profit/byproduct",
         {
-            "filter": f"{base_filter};assortment={href}",
+            "momentFrom": format_moysklad_datetime(since),
+            "momentTo": format_moysklad_datetime(datetime.now()),
+            "limit": 1000,
+        },
+    )
+
+    sold_by_href: dict[str, Decimal] = {}
+    for row in rows:
+        href = assortment_href(row.get("assortment") or {})
+        if not href:
+            continue
+        quantity = to_optional_decimal(row.get("sellQuantity")) or Decimal("0")
+        sold_by_href[href] = sold_by_href.get(href, Decimal("0")) + quantity
+    return sold_by_href
+
+
+def load_recently_ordered_hrefs(client: MoySkladClient, months_back: int) -> set[str]:
+    since = subtract_months(datetime.now(), months_back)
+    orders = iter_collection(
+        client,
+        "/entity/purchaseorder",
+        {
+            "filter": f"moment>={format_moysklad_datetime(since)}",
             "expand": "positions.assortment",
             "limit": 100,
         },
     )
 
-    total = Decimal("0")
-    for document in documents:
-        document_id = str(document.get("id") or "")
-        if not document_id:
+    hrefs: set[str] = set()
+    for order in orders:
+        order_id = str(order.get("id") or "")
+        if not order_id:
             continue
-
-        for position in document_positions(client, document, document_id, "demand"):
-            assortment = position_assortment(position)
-            if assortment_href(assortment) != href:
-                continue
-            total += to_decimal(position.get("quantity", "0"), "количества проданной позиции")
-
-    return total
-
-
-def has_recent_purchase_order(
-    client: MoySkladClient,
-    base_filter: str,
-    href: str,
-) -> bool:
-    orders = iter_collection(
-        client,
-        "/entity/purchaseorder",
-        {
-            "filter": f"{base_filter};assortment={href}",
-            "limit": 1,
-        },
-    )
-    return bool(orders)
-
-
-def evaluate_purchase_report_candidate(
-    client: MoySkladClient,
-    sold_filter: str,
-    ordered_filter: str,
-    card: AssortmentCard,
-) -> PurchaseReportRow | None:
-    sold_quantity = sold_quantity_for_assortment(client, sold_filter, card.href)
-    if sold_quantity < REPORT_MIN_SOLD_QUANTITY:
-        return None
-    if has_recent_purchase_order(client, ordered_filter, card.href):
-        return None
-    return PurchaseReportRow(name=card.name, sold_quantity=sold_quantity)
+        for position in document_positions(client, order, order_id, "purchaseorder"):
+            href = assortment_href(position_assortment(position))
+            if href:
+                hrefs.add(href)
+    return hrefs
 
 
 def build_purchase_report(client: MoySkladClient) -> list[PurchaseReportRow]:
@@ -990,28 +975,17 @@ def build_purchase_report(client: MoySkladClient) -> list[PurchaseReportRow]:
     if not zero_stock_cards:
         return []
 
-    sold_since = subtract_months(datetime.now(), REPORT_SOLD_MONTHS_BACK)
-    sold_filter = f"moment>={format_moysklad_datetime(sold_since)};applicable=true"
-    ordered_since = subtract_months(datetime.now(), REPORT_NOT_ORDERED_MONTHS_BACK)
-    ordered_filter = f"moment>={format_moysklad_datetime(ordered_since)}"
+    sold_by_href = load_sold_quantity_by_href(client, REPORT_SOLD_MONTHS_BACK)
+    ordered_hrefs = load_recently_ordered_hrefs(client, REPORT_NOT_ORDERED_MONTHS_BACK)
 
     rows: list[PurchaseReportRow] = []
-    workers = min(REPORT_MAX_WORKERS, len(zero_stock_cards))
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(
-                evaluate_purchase_report_candidate,
-                client,
-                sold_filter,
-                ordered_filter,
-                card,
-            )
-            for card in zero_stock_cards
-        ]
-        for future in as_completed(futures):
-            row = future.result()
-            if row is not None:
-                rows.append(row)
+    for card in zero_stock_cards:
+        sold_quantity = sold_by_href.get(card.href, Decimal("0"))
+        if sold_quantity < REPORT_MIN_SOLD_QUANTITY:
+            continue
+        if card.href in ordered_hrefs:
+            continue
+        rows.append(PurchaseReportRow(name=card.name, sold_quantity=sold_quantity))
 
     rows.sort(key=lambda row: (row.sold_quantity, row.name.lower()), reverse=True)
     return rows
