@@ -68,8 +68,9 @@ class AvitoClient:
                 "client_secret": self.client_secret,
             }
         ).encode("utf-8")
+        url = f"{AVITO_API_BASE_URL}{AVITO_TOKEN_PATH}"
         request = Request(
-            f"{AVITO_API_BASE_URL}{AVITO_TOKEN_PATH}",
+            url,
             data=body,
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -82,6 +83,8 @@ class AvitoClient:
             raise AvitoError(f"Avito auth HTTP {error.code}: {parse_avito_error(text)}") from error
         except URLError as error:
             raise AvitoError(f"Avito auth network error: {error.reason}") from error
+        except json.JSONDecodeError as error:
+            raise AvitoError(f"Avito API returned invalid JSON from {url}") from error
 
         access_token = data.get("access_token")
         expires_in = data.get("expires_in")
@@ -132,6 +135,8 @@ class AvitoClient:
                     time.sleep(2**attempt)
                     continue
                 raise AvitoError(f"Avito network error: {error.reason}") from error
+            except json.JSONDecodeError as error:
+                raise AvitoError(f"Avito API returned invalid JSON from {url}") from error
 
         raise AvitoError("Avito request failed after retries")
 
