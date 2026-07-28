@@ -8,17 +8,21 @@ import os
 import ssl
 import sys
 import time
+import uuid
 from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from difflib import SequenceMatcher
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from openpyxl import Workbook
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -258,6 +262,34 @@ def encode_body(body: dict[str, Any] | list[Any] | None) -> bytes | None:
     if body is None:
         return None
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def encode_multipart_form(
+    fields: dict[str, str],
+    file_field_name: str,
+    filename: str,
+    file_bytes: bytes,
+    file_content_type: str,
+) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+            f'{value}\r\n'.encode("utf-8")
+        )
+
+    parts.append(
+        f'--{boundary}\r\n'
+        f'Content-Disposition: form-data; name="{file_field_name}"; filename="{filename}"\r\n'
+        f'Content-Type: {file_content_type}\r\n\r\n'.encode("utf-8")
+    )
+    parts.append(file_bytes)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def parse_api_error(text: str) -> str:
@@ -1005,6 +1037,19 @@ def format_purchase_report(rows: list[PurchaseReportRow]) -> str:
     return "\n".join(lines)
 
 
+def build_purchase_report_workbook(rows: list[PurchaseReportRow]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Отчет по закупкам"
+    sheet.append(["Название", f"Продано за {REPORT_SOLD_MONTHS_BACK} мес."])
+    for row in rows:
+        sheet.append([row.name, float(row.sold_quantity)])
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
 def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -1047,13 +1092,13 @@ class TelegramClient:
         self.base_url = f"{TELEGRAM_API_BASE_URL}/bot{token}"
         self.ssl_context = ssl_context
 
-    def request(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _post(self, method: str, body: bytes, content_type: str) -> dict[str, Any]:
         url = f"{self.base_url}/{method}"
         request = Request(
             url,
-            data=encode_body(payload or {}),
+            data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": content_type},
         )
         try:
             with urlopen(request, timeout=TIMEOUT_SECONDS, context=self.ssl_context) as response:
@@ -1068,6 +1113,33 @@ class TelegramClient:
         if not data.get("ok"):
             raise BotError(f"Telegram API error: {data}")
         return data
+
+    def request(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._post(method, encode_body(payload or {}), "application/json")
+
+    def send_document(
+        self,
+        chat_id: int,
+        filename: str,
+        file_bytes: bytes,
+        content_type: str = "application/octet-stream",
+        caption: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        fields = {"chat_id": str(chat_id)}
+        if caption:
+            fields["caption"] = caption
+        if reply_markup:
+            fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+
+        body, multipart_content_type = encode_multipart_form(
+            fields,
+            "document",
+            filename,
+            file_bytes,
+            content_type,
+        )
+        self._post("sendDocument", body, multipart_content_type)
 
     def get_updates(self, offset: int | None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"timeout": 50, "allowed_updates": ["message"]}
@@ -1245,9 +1317,21 @@ def handle_message(
             )
             return
 
-        telegram.send_long_message(
+        if not rows:
+            telegram.send_message(
+                chat_id,
+                format_purchase_report(rows),
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        workbook_bytes = build_purchase_report_workbook(rows)
+        telegram.send_document(
             chat_id,
-            format_purchase_report(rows),
+            filename=f"purchase_report_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            file_bytes=workbook_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            caption=f"Найдено позиций: {len(rows)}",
             reply_markup=main_keyboard(role),
         )
         return

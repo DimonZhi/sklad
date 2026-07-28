@@ -10,6 +10,12 @@ Copy `.env.example` to `.env` and fill secrets:
 cp .env.example .env
 ```
 
+Install Python dependencies (needed for the `Отчет по закупкам` Excel export):
+
+```bash
+pip3 install -r requirements.txt
+```
+
 Required values:
 
 - `MOYSKLAD_TOKEN` - MoySklad API token.
