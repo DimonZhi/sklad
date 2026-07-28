@@ -40,8 +40,14 @@ MAX_SEARCH_GROUPS = 20
 MAX_SEARCH_CANDIDATES = 30
 MAX_SEARCH_WORKERS = 6
 ASSORTMENT_CACHE_SECONDS = 8 * 60 * 60
+REPORT_SOLD_MONTHS_BACK = 12
+REPORT_NOT_ORDERED_MONTHS_BACK = 2
+REPORT_MIN_SOLD_QUANTITY = Decimal("2")
+REPORT_MAX_WORKERS = 6
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
+REPORT_BUTTON = "Отчет по закупкам"
+BACK_BUTTON = "Назад"
 DEFAULT_TELEGRAM_ACCESS_PASSWORD = "1821"
 DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD = "123"
 ROLE_ADMIN = "admin"
@@ -125,6 +131,12 @@ class AssortmentCard:
 class AssortmentCache:
     loaded_at: float
     cards: list[AssortmentCard]
+
+
+@dataclass
+class PurchaseReportRow:
+    name: str
+    sold_quantity: Decimal
 
 
 _assortment_cache: AssortmentCache | None = None
@@ -749,12 +761,13 @@ def position_assortment(position: dict[str, Any]) -> dict[str, Any]:
     return assortment
 
 
-def purchase_order_positions(
+def document_positions(
     client: MoySkladClient,
-    order: dict[str, Any],
-    order_id: str,
+    document: dict[str, Any],
+    document_id: str,
+    entity_name: str,
 ) -> list[dict[str, Any]]:
-    positions = order.get("positions")
+    positions = document.get("positions")
     if isinstance(positions, dict):
         rows = positions.get("rows")
         meta = positions.get("meta") if isinstance(positions.get("meta"), dict) else {}
@@ -764,9 +777,17 @@ def purchase_order_positions(
 
     return iter_collection(
         client,
-        f"/entity/purchaseorder/{order_id}/positions",
+        f"/entity/{entity_name}/{document_id}/positions",
         {"expand": "assortment", "limit": 1000},
     )
+
+
+def purchase_order_positions(
+    client: MoySkladClient,
+    order: dict[str, Any],
+    order_id: str,
+) -> list[dict[str, Any]]:
+    return document_positions(client, order, order_id, "purchaseorder")
 
 
 def find_purchase_orders_for_candidate(
@@ -900,6 +921,116 @@ def format_purchase_order_matches(query: str, result: AlbumSearchResult) -> str:
     return "\n\n".join(blocks)
 
 
+def sold_quantity_for_assortment(
+    client: MoySkladClient,
+    base_filter: str,
+    href: str,
+) -> Decimal:
+    documents = iter_collection(
+        client,
+        "/entity/demand",
+        {
+            "filter": f"{base_filter};assortment={href}",
+            "expand": "positions.assortment",
+            "limit": 100,
+        },
+    )
+
+    total = Decimal("0")
+    for document in documents:
+        document_id = str(document.get("id") or "")
+        if not document_id:
+            continue
+
+        for position in document_positions(client, document, document_id, "demand"):
+            assortment = position_assortment(position)
+            if assortment_href(assortment) != href:
+                continue
+            total += to_decimal(position.get("quantity", "0"), "количества проданной позиции")
+
+    return total
+
+
+def has_recent_purchase_order(
+    client: MoySkladClient,
+    base_filter: str,
+    href: str,
+) -> bool:
+    orders = iter_collection(
+        client,
+        "/entity/purchaseorder",
+        {
+            "filter": f"{base_filter};assortment={href}",
+            "limit": 1,
+        },
+    )
+    return bool(orders)
+
+
+def evaluate_purchase_report_candidate(
+    client: MoySkladClient,
+    sold_filter: str,
+    ordered_filter: str,
+    card: AssortmentCard,
+) -> PurchaseReportRow | None:
+    sold_quantity = sold_quantity_for_assortment(client, sold_filter, card.href)
+    if sold_quantity < REPORT_MIN_SOLD_QUANTITY:
+        return None
+    if has_recent_purchase_order(client, ordered_filter, card.href):
+        return None
+    return PurchaseReportRow(name=card.name, sold_quantity=sold_quantity)
+
+
+def build_purchase_report(client: MoySkladClient) -> list[PurchaseReportRow]:
+    zero_stock_cards = [
+        card
+        for card in load_assortment_cards(client)
+        if card.available_quantity is not None and card.available_quantity == 0
+    ]
+    if not zero_stock_cards:
+        return []
+
+    sold_since = subtract_months(datetime.now(), REPORT_SOLD_MONTHS_BACK)
+    sold_filter = f"moment>={format_moysklad_datetime(sold_since)};applicable=true"
+    ordered_since = subtract_months(datetime.now(), REPORT_NOT_ORDERED_MONTHS_BACK)
+    ordered_filter = f"moment>={format_moysklad_datetime(ordered_since)}"
+
+    rows: list[PurchaseReportRow] = []
+    workers = min(REPORT_MAX_WORKERS, len(zero_stock_cards))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                evaluate_purchase_report_candidate,
+                client,
+                sold_filter,
+                ordered_filter,
+                card,
+            )
+            for card in zero_stock_cards
+        ]
+        for future in as_completed(futures):
+            row = future.result()
+            if row is not None:
+                rows.append(row)
+
+    rows.sort(key=lambda row: (row.sold_quantity, row.name.lower()), reverse=True)
+    return rows
+
+
+def format_purchase_report(rows: list[PurchaseReportRow]) -> str:
+    if not rows:
+        return (
+            "Нет позиций с нулевым остатком, продажами "
+            f"от {format_quantity(REPORT_MIN_SOLD_QUANTITY)} шт. за {REPORT_SOLD_MONTHS_BACK} мес. "
+            f"и без заказов поставщикам за последние {REPORT_NOT_ORDERED_MONTHS_BACK} мес."
+        )
+
+    lines = [f"Нужно заказать ({len(rows)}):"]
+    for row in rows:
+        lines.append(f"{row.name} - продано {format_quantity(row.sold_quantity)} за год")
+    return "\n".join(lines)
+
+
 def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -998,12 +1129,23 @@ class TelegramClient:
 
 def main_keyboard(role: str) -> dict[str, Any]:
     if role == ROLE_ADMIN:
-        keyboard = [[{"text": SEARCH_BUTTON}], [{"text": CONVERT_BUTTON}]]
+        keyboard = [
+            [{"text": SEARCH_BUTTON}],
+            [{"text": CONVERT_BUTTON}],
+            [{"text": REPORT_BUTTON}],
+        ]
     else:
         keyboard = [[{"text": SEARCH_BUTTON}]]
 
     return {
         "keyboard": keyboard,
+        "resize_keyboard": True,
+    }
+
+
+def search_keyboard() -> dict[str, Any]:
+    return {
+        "keyboard": [[{"text": BACK_BUTTON}]],
         "resize_keyboard": True,
     }
 
@@ -1086,7 +1228,11 @@ def handle_message(
 
     if normalized_text == SEARCH_BUTTON:
         states[chat_id] = DialogState(step="search")
-        telegram.send_message(chat_id, "Введите название альбома для поиска.")
+        telegram.send_message(
+            chat_id,
+            "Введите название альбома для поиска.",
+            reply_markup=search_keyboard(),
+        )
         return
 
     if normalized_text == CONVERT_BUTTON:
@@ -1103,6 +1249,35 @@ def handle_message(
         telegram.send_message(chat_id, "Введите номер приемки, например 28.")
         return
 
+    if normalized_text == REPORT_BUTTON:
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        states.pop(chat_id, None)
+        telegram.send_message(chat_id, "Формирую отчет по закупкам...")
+        try:
+            rows = build_purchase_report(moysklad)
+        except (MoySkladError, BotError) as error:
+            telegram.send_message(
+                chat_id,
+                f"Не получилось сформировать отчет: {error}",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        telegram.send_long_message(
+            chat_id,
+            format_purchase_report(rows),
+            reply_markup=main_keyboard(role),
+        )
+        return
+
     state = states.get(chat_id)
     if state is None:
         telegram.send_message(
@@ -1113,29 +1288,35 @@ def handle_message(
         return
 
     if state.step == "search":
+        if normalized_text == BACK_BUTTON:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Выберите действие.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
         telegram.send_message(chat_id, "Ищу в заказах поставщикам...")
         try:
             matches = search_purchase_orders(moysklad, normalized_text)
             message = format_purchase_order_matches(normalized_text, matches)
         except VinylNotFound as error:
-            states.pop(chat_id, None)
             telegram.send_message(
                 chat_id,
                 str(error),
-                reply_markup=main_keyboard(role),
+                reply_markup=search_keyboard(),
             )
             return
         except (MoySkladError, BotError) as error:
-            states.pop(chat_id, None)
             telegram.send_message(
                 chat_id,
                 f"Не получилось выполнить поиск: {error}",
-                reply_markup=main_keyboard(role),
+                reply_markup=search_keyboard(),
             )
             return
 
-        states.pop(chat_id, None)
-        telegram.send_long_message(chat_id, message, reply_markup=main_keyboard(role))
+        telegram.send_long_message(chat_id, message, reply_markup=search_keyboard())
         return
 
     if state.step == "supply":
