@@ -17,6 +17,7 @@
 - Avito credentials are optional at bot startup (the bot must still run if they're unset) — the new button reports a clear configuration error at press-time instead. This avoids bricking the whole bot over one new feature not yet configured on a given deployment.
 - This plan is Phase 1 only. No systemd timer, no persistent order-tracking state file, no "sold but no demand" auto-alert — that is a separate, later plan blocked on finding the Avito orders/delivery API endpoint (not yet located).
 - No automated test suite exists anywhere in this project. "Tests" in this plan are manual verification runs against the real, live MoySklad and Avito accounts (via the credentials already in `.env`), matching how every other feature in this codebase has been verified so far.
+- `scripts/avito_client.py` must never import `telegram_price_bot` at module level. `telegram_price_bot.py` imports `avito_client` (Task 3), so the reverse would be a circular import that crashes on startup. Any reference to `telegram_price_bot` symbols from `avito_client.py` must be `TYPE_CHECKING`-guarded (for type hints) or a deferred, function-local import (for runtime values) — see Task 2, Step 1.
 
 ---
 
@@ -262,17 +263,21 @@ EOF
 - Modify: `scripts/avito_client.py` (append to the file created in Task 1)
 
 **Interfaces:**
-- Consumes: `AvitoClient.iter_active_items() -> list[AvitoItem]` (Task 1); `telegram_price_bot.AssortmentCard` (`name: str, href: str, available_quantity: Decimal | None`), `telegram_price_bot.album_match_score(query: str, album_name: str) -> float`, `telegram_price_bot.load_assortment_cards(client: MoySkladClient) -> list[AssortmentCard]`, `telegram_price_bot.MoySkladClient`.
+- Consumes: `AvitoClient.iter_active_items() -> list[AvitoItem]` (Task 1); `telegram_price_bot.AssortmentCard` (`name: str, href: str, available_quantity: Decimal | None`), `telegram_price_bot.album_match_score(query: str, album_name: str) -> float`, `telegram_price_bot.load_assortment_cards(client: MoySkladClient) -> list[AssortmentCard]`, `telegram_price_bot.MoySkladClient`. These are consumed via a `TYPE_CHECKING`-guarded import plus deferred, function-local imports — never a module-level runtime import — because Task 3 makes `telegram_price_bot.py` import this module, and a module-level import back would be circular. See Step 1 for the exact pattern; use it as written.
 - Produces: `@dataclass class QuantityDiffRow: avito_title: str; matched_name: str | None; match_score: float; avito_active_count: int; moysklad_quantity: Decimal | None; status: str`; constants `STATUS_OK = "OK"`, `STATUS_MISMATCH = "MISMATCH"`, `STATUS_NO_MATCH = "NO_CONFIDENT_MATCH"`; `build_quantity_diff_rows(moysklad_client: MoySkladClient, avito_client: AvitoClient) -> list[QuantityDiffRow]`.
 
 - [ ] **Step 1: Add imports and matching/diff logic to `scripts/avito_client.py`**
+
+**Important — avoiding a circular import:** Task 3 will make `telegram_price_bot.py` import from this module (`avito_client.py`). If this module also imports `telegram_price_bot` at module level, Python hits a circular import the moment `telegram_price_bot.py` is run directly (`ImportError: cannot import name ... from partially initialized module 'telegram_price_bot'`) — `telegram_price_bot.py`'s own top-level `from avito_client import ...` would trigger loading this module before `telegram_price_bot` has finished defining `AssortmentCard`/`MoySkladClient`/etc. Avoid this with a `TYPE_CHECKING`-guarded import for type hints (never executed at runtime) plus deferred, function-local imports for the actual values — by the time these functions are called, `telegram_price_bot` has always already finished loading.
 
 Add these imports at the top of the file (after the existing `from urllib.request import Request, urlopen` line):
 
 ```python
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-from telegram_price_bot import AssortmentCard, MoySkladClient, album_match_score, load_assortment_cards
+if TYPE_CHECKING:
+    from telegram_price_bot import AssortmentCard, MoySkladClient
 ```
 
 Append to the end of the file:
@@ -280,12 +285,14 @@ Append to the end of the file:
 ```python
 @dataclass
 class AssortmentMatch:
-    card: AssortmentCard
+    card: "AssortmentCard"
     score: float
 
 
-def match_to_assortment(title: str, cards: list[AssortmentCard]) -> AssortmentMatch | None:
-    best_card: AssortmentCard | None = None
+def match_to_assortment(title: str, cards: list["AssortmentCard"]) -> AssortmentMatch | None:
+    from telegram_price_bot import album_match_score
+
+    best_card: "AssortmentCard | None" = None
     best_score = 0.0
     for card in cards:
         score = album_match_score(title, card.name)
@@ -314,9 +321,11 @@ class QuantityDiffRow:
 
 
 def build_quantity_diff_rows(
-    moysklad_client: MoySkladClient,
+    moysklad_client: "MoySkladClient",
     avito_client: AvitoClient,
 ) -> list[QuantityDiffRow]:
+    from telegram_price_bot import load_assortment_cards
+
     cards = load_assortment_cards(moysklad_client)
     avito_items = avito_client.iter_active_items()
 
