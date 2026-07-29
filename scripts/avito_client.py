@@ -14,7 +14,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from telegram_price_bot import AssortmentCard, MoySkladClient
+    from telegram_price_bot import AssortmentCard
 
 
 AVITO_API_BASE_URL = "https://api.avito.ru"
@@ -235,7 +235,6 @@ class QuantityDiffRow:
 
 
 def build_quantity_diff_rows(
-    moysklad_client: "MoySkladClient",
     avito_client: AvitoClient,
     cards: list["AssortmentCard"],
 ) -> list[QuantityDiffRow]:
