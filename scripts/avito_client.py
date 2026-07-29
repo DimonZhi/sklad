@@ -24,6 +24,7 @@ AVITO_ITEMS_PER_PAGE = 100
 AVITO_TIMEOUT_SECONDS = 60
 AVITO_MAX_RETRIES = 4
 AVITO_MATCH_THRESHOLD = 0.9
+AVITO_MAX_PAGES = 200
 
 
 class AvitoError(RuntimeError):
@@ -95,7 +96,9 @@ class AvitoClient:
         access_token = data.get("access_token")
         expires_in = data.get("expires_in")
         if not access_token or not isinstance(expires_in, (int, float)):
-            raise AvitoError(f"Avito auth response missing token fields: {data}")
+            raise AvitoError(
+                f"Avito auth response missing expected fields; got keys: {list(data.keys())}"
+            )
 
         self._token = str(access_token)
         self._token_expires_at = time.time() + float(expires_in) - 60
@@ -177,6 +180,10 @@ class AvitoClient:
             if len(resources) < AVITO_ITEMS_PER_PAGE:
                 return items
             page += 1
+            if page > AVITO_MAX_PAGES:
+                raise AvitoError(
+                    f"Avito pagination exceeded {AVITO_MAX_PAGES} pages without terminating — possible API issue"
+                )
 
 
 @dataclass
@@ -230,10 +237,10 @@ class QuantityDiffRow:
 def build_quantity_diff_rows(
     moysklad_client: "MoySkladClient",
     avito_client: AvitoClient,
+    cards: list["AssortmentCard"],
 ) -> list[QuantityDiffRow]:
-    from telegram_price_bot import load_assortment_cards, normalize_text
+    from telegram_price_bot import normalize_text
 
-    cards = load_assortment_cards(moysklad_client)
     avito_items = avito_client.iter_active_items()
 
     exact_index: dict[str, "AssortmentCard"] = {}

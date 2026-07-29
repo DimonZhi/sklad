@@ -1388,7 +1388,8 @@ def handle_message(
 
         telegram.send_message(chat_id, "Проверяю количество в Avito и МойСклад...")
         try:
-            rows = build_quantity_diff_rows(moysklad, avito)
+            cards = load_assortment_cards(moysklad)
+            rows = build_quantity_diff_rows(moysklad, avito, cards)
         except (MoySkladError, AvitoError, BotError) as error:
             telegram.send_message(
                 chat_id,
