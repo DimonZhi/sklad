@@ -10,6 +10,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from telegram_price_bot import AssortmentCard, MoySkladClient
+
 
 AVITO_API_BASE_URL = "https://api.avito.ru"
 AVITO_TOKEN_PATH = "/token"
@@ -171,3 +177,118 @@ class AvitoClient:
             if len(resources) < AVITO_ITEMS_PER_PAGE:
                 return items
             page += 1
+
+
+@dataclass
+class AssortmentMatch:
+    card: "AssortmentCard"
+    score: float
+
+
+def match_to_assortment(
+    title: str,
+    cards: list["AssortmentCard"],
+    exact_index: dict[str, "AssortmentCard"] | None = None,
+) -> AssortmentMatch | None:
+    from telegram_price_bot import album_match_score, normalize_text
+
+    if exact_index is not None:
+        exact_card = exact_index.get(normalize_text(title))
+        if exact_card is not None:
+            return AssortmentMatch(card=exact_card, score=1.0)
+
+    best_card: "AssortmentCard | None" = None
+    best_score = 0.0
+    for card in cards:
+        score = album_match_score(title, card.name)
+        if score > best_score:
+            best_score = score
+            best_card = card
+
+    if best_card is None or best_score < AVITO_MATCH_THRESHOLD:
+        return None
+    return AssortmentMatch(card=best_card, score=best_score)
+
+
+STATUS_OK = "OK"
+STATUS_MISMATCH = "MISMATCH"
+STATUS_NO_MATCH = "NO_CONFIDENT_MATCH"
+
+
+@dataclass
+class QuantityDiffRow:
+    avito_title: str
+    matched_name: str | None
+    match_score: float
+    avito_active_count: int
+    moysklad_quantity: Decimal | None
+    status: str
+
+
+def build_quantity_diff_rows(
+    moysklad_client: "MoySkladClient",
+    avito_client: AvitoClient,
+) -> list[QuantityDiffRow]:
+    from telegram_price_bot import load_assortment_cards, normalize_text
+
+    cards = load_assortment_cards(moysklad_client)
+    avito_items = avito_client.iter_active_items()
+
+    exact_index: dict[str, "AssortmentCard"] = {}
+    for card in cards:
+        key = normalize_text(card.name)
+        if key not in exact_index:
+            exact_index[key] = card
+
+    avito_count_by_href: dict[str, int] = {}
+    match_score_by_href: dict[str, float] = {}
+    unmatched_counts: dict[str, int] = {}
+
+    for item in avito_items:
+        match = match_to_assortment(item.title, cards, exact_index)
+        if match is None:
+            unmatched_counts[item.title] = unmatched_counts.get(item.title, 0) + 1
+            continue
+
+        href = match.card.href
+        avito_count_by_href[href] = avito_count_by_href.get(href, 0) + 1
+        match_score_by_href[href] = max(match_score_by_href.get(href, 0.0), match.score)
+
+    rows: list[QuantityDiffRow] = []
+    for card in cards:
+        avito_count = avito_count_by_href.get(card.href, 0)
+        moysklad_quantity = card.available_quantity
+        if avito_count == 0 and (moysklad_quantity is None or moysklad_quantity == 0):
+            continue
+
+        quantities_match = moysklad_quantity is not None and moysklad_quantity == avito_count
+        rows.append(
+            QuantityDiffRow(
+                avito_title=card.name,
+                matched_name=card.name,
+                match_score=match_score_by_href.get(card.href, 0.0),
+                avito_active_count=avito_count,
+                moysklad_quantity=moysklad_quantity,
+                status=STATUS_OK if quantities_match else STATUS_MISMATCH,
+            )
+        )
+
+    for title, count in unmatched_counts.items():
+        rows.append(
+            QuantityDiffRow(
+                avito_title=title,
+                matched_name=None,
+                match_score=0.0,
+                avito_active_count=count,
+                moysklad_quantity=None,
+                status=STATUS_NO_MATCH,
+            )
+        )
+
+    rows.sort(
+        key=lambda row: (
+            row.status == STATUS_OK,
+            row.avito_title.lower(),
+        )
+    )
+    return rows

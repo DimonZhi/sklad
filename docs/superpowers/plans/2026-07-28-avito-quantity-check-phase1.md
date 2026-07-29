@@ -289,8 +289,17 @@ class AssortmentMatch:
     score: float
 
 
-def match_to_assortment(title: str, cards: list["AssortmentCard"]) -> AssortmentMatch | None:
-    from telegram_price_bot import album_match_score
+def match_to_assortment(
+    title: str,
+    cards: list["AssortmentCard"],
+    exact_index: dict[str, "AssortmentCard"] | None = None,
+) -> AssortmentMatch | None:
+    from telegram_price_bot import album_match_score, normalize_text
+
+    if exact_index is not None:
+        exact_card = exact_index.get(normalize_text(title))
+        if exact_card is not None:
+            return AssortmentMatch(card=exact_card, score=1.0)
 
     best_card: "AssortmentCard | None" = None
     best_score = 0.0
@@ -324,17 +333,23 @@ def build_quantity_diff_rows(
     moysklad_client: "MoySkladClient",
     avito_client: AvitoClient,
 ) -> list[QuantityDiffRow]:
-    from telegram_price_bot import load_assortment_cards
+    from telegram_price_bot import load_assortment_cards, normalize_text
 
     cards = load_assortment_cards(moysklad_client)
     avito_items = avito_client.iter_active_items()
+
+    exact_index: dict[str, "AssortmentCard"] = {}
+    for card in cards:
+        key = normalize_text(card.name)
+        if key not in exact_index:
+            exact_index[key] = card
 
     avito_count_by_href: dict[str, int] = {}
     match_score_by_href: dict[str, float] = {}
     unmatched_counts: dict[str, int] = {}
 
     for item in avito_items:
-        match = match_to_assortment(item.title, cards)
+        match = match_to_assortment(item.title, cards, exact_index)
         if match is None:
             unmatched_counts[item.title] = unmatched_counts.get(item.title, 0) + 1
             continue
@@ -384,6 +399,8 @@ def build_quantity_diff_rows(
 ```
 
 Note the design choice made here: items with zero active Avito listings AND zero/unknown MoySklad quantity are skipped entirely (nothing to report). Everything else — including confident `OK` matches — is included, since the approved spec calls for "an Excel file comparing MoySklad quantity against Avito listing count for every title, with mismatches flagged," not a mismatches-only filter.
+
+**Performance note (added after live testing):** a naive full cross-product of `album_match_score` calls (every Avito title against every MoySklad card — roughly 1546 × 5804 ≈ 9 million comparisons against this account's real data) took over two minutes and, worse, blocks the bot's single-threaded main loop for every user while it runs, not just the admin who pressed the button. The `exact_index` parameter above is a fast path: since the vast majority of real matches turned out to be exact-title matches (confirmed against live data), an O(1) normalized-title lookup resolves most items instantly, and the expensive fuzzy scan only runs for titles that miss the exact-match index. `build_quantity_diff_rows` builds this index once per call and passes it through.
 
 - [ ] **Step 2: Compile-check**
 
