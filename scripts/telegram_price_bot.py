@@ -24,6 +24,8 @@ from urllib.request import Request, urlopen
 
 from openpyxl import Workbook
 
+from avito_client import AvitoClient, AvitoError, QuantityDiffRow, build_quantity_diff_rows
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -50,6 +52,7 @@ REPORT_MIN_SOLD_QUANTITY = Decimal("2")
 CONVERT_BUTTON = "Конвертировать цены в приемке"
 SEARCH_BUTTON = "Поиск по складу"
 REPORT_BUTTON = "Отчет по закупкам"
+CHECK_QUANTITY_BUTTON = "Проверить количество"
 BACK_BUTTON = "Назад"
 DEFAULT_TELEGRAM_ACCESS_PASSWORD = "1821"
 DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD = "123"
@@ -1050,6 +1053,32 @@ def build_purchase_report_workbook(rows: list[PurchaseReportRow]) -> bytes:
     return buffer.getvalue()
 
 
+def build_quantity_diff_workbook(rows: list[QuantityDiffRow]) -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Проверка количества"
+    sheet.append(
+        ["Название", "Кол-во на Avito", "Кол-во в МойСклад", "Статус", "Уверенность совпадения"]
+    )
+    for row in rows:
+        moysklad_quantity = (
+            float(row.moysklad_quantity) if row.moysklad_quantity is not None else "неизвестно"
+        )
+        sheet.append(
+            [
+                row.avito_title,
+                row.avito_active_count,
+                moysklad_quantity,
+                row.status,
+                round(row.match_score, 3),
+            ]
+        )
+
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
 def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
     if len(text) <= limit:
         return [text]
@@ -1179,6 +1208,7 @@ def main_keyboard(role: str) -> dict[str, Any]:
             [{"text": SEARCH_BUTTON}],
             [{"text": CONVERT_BUTTON}],
             [{"text": REPORT_BUTTON}],
+            [{"text": CHECK_QUANTITY_BUTTON}],
         ]
     else:
         keyboard = [[{"text": SEARCH_BUTTON}]]
@@ -1247,6 +1277,7 @@ def result_message(result: PriceUpdateResult) -> str:
 def handle_message(
     telegram: TelegramClient,
     moysklad: MoySkladClient,
+    avito: AvitoClient | None,
     states: dict[int, DialogState],
     chat_id: int,
     text: str,
@@ -1332,6 +1363,55 @@ def handle_message(
             file_bytes=workbook_bytes,
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             caption=f"Найдено позиций: {len(rows)}",
+            reply_markup=main_keyboard(role),
+        )
+        return
+
+    if normalized_text == CHECK_QUANTITY_BUTTON:
+        if role != ROLE_ADMIN:
+            states.pop(chat_id, None)
+            telegram.send_message(
+                chat_id,
+                "Эта команда доступна только админу.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        states.pop(chat_id, None)
+        if avito is None:
+            telegram.send_message(
+                chat_id,
+                "Avito не настроен: заполните AVITO_CLIENT_ID и AVITO_CLIENT_SECRET в .env.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        telegram.send_message(chat_id, "Проверяю количество в Avito и МойСклад...")
+        try:
+            rows = build_quantity_diff_rows(moysklad, avito)
+        except (MoySkladError, AvitoError, BotError) as error:
+            telegram.send_message(
+                chat_id,
+                f"Не получилось проверить количество: {error}",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        if not rows:
+            telegram.send_message(
+                chat_id,
+                "Расхождений не найдено.",
+                reply_markup=main_keyboard(role),
+            )
+            return
+
+        workbook_bytes = build_quantity_diff_workbook(rows)
+        telegram.send_document(
+            chat_id,
+            filename=f"quantity_check_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            file_bytes=workbook_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            caption=f"Проверено позиций: {len(rows)}",
             reply_markup=main_keyboard(role),
         )
         return
@@ -1494,6 +1574,8 @@ def main() -> int:
         "TELEGRAM_USER_ACCESS_PASSWORD",
         DEFAULT_TELEGRAM_USER_ACCESS_PASSWORD,
     ).strip()
+    avito_client_id = os.environ.get("AVITO_CLIENT_ID", "").strip()
+    avito_client_secret = os.environ.get("AVITO_CLIENT_SECRET", "").strip()
 
     if not telegram_token:
         print("Fill TELEGRAM_BOT_TOKEN in .env first", file=sys.stderr)
@@ -1511,6 +1593,11 @@ def main() -> int:
     ssl_context = create_ssl_context()
     telegram = TelegramClient(telegram_token, ssl_context)
     moysklad = MoySkladClient(moysklad_token, moysklad_base_url, ssl_context)
+    avito = (
+        AvitoClient(avito_client_id, avito_client_secret, ssl_context)
+        if avito_client_id and avito_client_secret
+        else None
+    )
     authorized_users = load_authorized_users(AUTHORIZED_USERS_PATH)
     states: dict[int, DialogState] = {}
     offset: int | None = None
@@ -1564,7 +1651,7 @@ def main() -> int:
                         telegram.send_message(chat_id, "Неверный пароль. Попробуйте еще раз.")
                     continue
 
-                handle_message(telegram, moysklad, states, chat_id, text, role)
+                handle_message(telegram, moysklad, avito, states, chat_id, text, role)
         except KeyboardInterrupt:
             print("Bot stopped.")
             return 0

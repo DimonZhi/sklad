@@ -23,6 +23,12 @@ Required values:
 - `TELEGRAM_ACCESS_PASSWORD` - admin password users enter in Telegram.
 - `TELEGRAM_USER_ACCESS_PASSWORD` - regular user password for stock search only.
 
+Optional (needed only for the `Проверить количество` button):
+
+- `AVITO_CLIENT_ID` / `AVITO_CLIENT_SECRET` - Avito API credentials from
+  avito.ru/professionals/api. If unset, the bot still runs; the button
+  replies with a configuration error instead of a report.
+
 By default, admin password is `1821`, regular user password is `123`.
 Admins receive importcds error alerts and can convert prices. Regular users only see
 the `Поиск по складу` button and do not receive alerts.
