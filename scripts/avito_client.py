@@ -193,9 +193,11 @@ def match_to_assortment(
     from telegram_price_bot import album_match_score, normalize_text
 
     if exact_index is not None:
-        exact_card = exact_index.get(normalize_text(title))
-        if exact_card is not None:
-            return AssortmentMatch(card=exact_card, score=1.0)
+        normalized_title = normalize_text(title)
+        if normalized_title:
+            exact_card = exact_index.get(normalized_title)
+            if exact_card is not None:
+                return AssortmentMatch(card=exact_card, score=1.0)
 
     best_card: "AssortmentCard | None" = None
     best_score = 0.0
@@ -237,7 +239,7 @@ def build_quantity_diff_rows(
     exact_index: dict[str, "AssortmentCard"] = {}
     for card in cards:
         key = normalize_text(card.name)
-        if key not in exact_index:
+        if key and key not in exact_index:
             exact_index[key] = card
 
     avito_count_by_href: dict[str, int] = {}
