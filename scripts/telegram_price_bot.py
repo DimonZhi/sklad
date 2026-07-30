@@ -1066,7 +1066,14 @@ def build_listing_report_workbook(report: ListingReport) -> bytes:
     action_sheet = workbook.active
     action_sheet.title = "Проверить"
     action_sheet.append(
-        ["Название", "Остаток МойСклад", "Объявление Avito", "Что не так", "Совпадение"]
+        [
+            "Название",
+            "Остаток МойСклад",
+            "Объявление Avito",
+            "Что не так",
+            "Совпадение",
+            "Вариантов в МойСклад",
+        ]
     )
     for row in report.action_required:
         action_sheet.append(
@@ -1076,6 +1083,7 @@ def build_listing_report_workbook(report: ListingReport) -> bytes:
                 row.avito_state,
                 row.status,
                 round(row.match_score, 3),
+                row.variant_count,
             ]
         )
 

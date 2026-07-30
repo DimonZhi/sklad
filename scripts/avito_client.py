@@ -6,7 +6,6 @@ import re
 import ssl
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -28,14 +27,13 @@ AVITO_TIMEOUT_SECONDS = 60
 AVITO_MAX_RETRIES = 4
 AVITO_MATCH_THRESHOLD = 0.9
 AVITO_MAX_PAGES = 200
-AVITO_CLOSED_STATUSES = ("old", "removed")
-AVITO_ACCOUNTS_PATH = "/core/v1/accounts"
-AVITO_ACCOUNT_SELF_PATH = f"{AVITO_ACCOUNTS_PATH}/self"
-# Avito unpublishes an ad 30 days after it goes up. Those ads are not sold —
-# they sit in "неопубликованные" until the seller re-activates them, so they
-# still count as listed. Only an ad that expired longer ago than this is
-# treated as genuinely gone.
-AVITO_PENDING_REACTIVATION_DAYS = 45
+# Avito unpublishes an ad 30 days after it goes up. Those ads land in
+# "неопубликованные" and the seller re-activates them later — the record is
+# still held and still for sale, so they count as listed however long they
+# have been sitting there. Only an ad the seller actually deleted is treated
+# as gone.
+AVITO_PENDING_STATUSES = ("old",)
+AVITO_CLOSED_STATUSES = ("removed",)
 # Rate limits need more patience than a transient 5xx: plain 2**attempt backoff only
 # buys ~15s total, which is well short of Avito's window. Bounded so a hostile or
 # mistaken Retry-After can never park the single-threaded bot for a long stretch.
@@ -113,7 +111,6 @@ class AvitoClient:
         self.ssl_context = ssl_context
         self._token: str | None = None
         self._token_expires_at: float = 0.0
-        self._account_id: int | None = None
 
     def _fetch_token(self) -> None:
         body = urlencode(
@@ -238,33 +235,19 @@ class AvitoClient:
                     f"Avito pagination exceeded {AVITO_MAX_PAGES} pages without terminating — possible API issue"
                 )
 
-    def account_id(self) -> int:
-        if self._account_id is None:
-            data = self.get(AVITO_ACCOUNT_SELF_PATH)
-            account_id = data.get("id")
-            if not isinstance(account_id, int):
-                raise AvitoError(f"Avito account response has no usable id: {list(data)}")
-            self._account_id = account_id
-        return self._account_id
-
-    def item_finish_time(self, item_id: int) -> datetime | None:
-        """When the ad's placement ends (or ended). None if unavailable."""
-        data = self.get(f"{AVITO_ACCOUNTS_PATH}/{self.account_id()}/items/{item_id}")
-        raw = data.get("finish_time")
-        if not raw:
-            return None
-        try:
-            return datetime.fromisoformat(str(raw))
-        except ValueError:
-            return None
-
     def iter_active_items(self) -> list[AvitoItem]:
         return self.iter_items("active")
 
+    def iter_pending_items(self) -> list[AvitoItem]:
+        """Ads whose 30-day placement lapsed and that wait in
+        "неопубликованные" to be re-activated. Still the seller's listings."""
+        items: list[AvitoItem] = []
+        for status in AVITO_PENDING_STATUSES:
+            items.extend(self.iter_items(status))
+        return items
+
     def iter_closed_items(self) -> list[AvitoItem]:
-        # "old" = placement expired, "removed" = deleted by the seller. Either way the
-        # ad existed and no longer runs, which is what distinguishes "was listed and is
-        # now gone" from "never listed at all".
+        """Ads the seller deleted outright."""
         items: list[AvitoItem] = []
         for status in AVITO_CLOSED_STATUSES:
             items.extend(self.iter_items(status))
@@ -289,6 +272,16 @@ def split_artist_album(name: str) -> tuple[str | None, str]:
 
 def _canon(tokens: list[str]) -> list[str]:
     return [ALBUM_SYNONYMS.get(token, token) for token in tokens]
+
+
+def _canon_text(text: str) -> str:
+    """Same synonyms, applied to raw text for the whole-title fallback, where
+    "Baby Driver soundtrack" and "Baby Driver OST" are the same record."""
+    def swap(match: re.Match[str]) -> str:
+        word = match.group(0)
+        return ALBUM_SYNONYMS.get(word.lower(), word)
+
+    return re.sub(r"[A-Za-zА-Яа-яЁё]+", swap, text)
 
 
 def artist_tokens(artist: str) -> list[str]:
@@ -379,13 +372,21 @@ def score_pair(avito_title: str, moysklad_name: str) -> float:
     if avito_artist is None or moysklad_artist is None:
         # No parseable artist on one side (compilations, soundtracks): fall back
         # to whole-title similarity rather than losing the match entirely.
-        whole = album_match_score(avito_title, moysklad_name)
-        if whole < AVITO_MATCH_THRESHOLD:
+        # Compilations and soundtracks carry no artist. Compare identity words
+        # only: album_match_score demands that *every* word of the ad appear on
+        # the card, which "Aerosmith's Greatest Hits (1 LP)" fails against
+        # "Aerosmith's Greatest Hits" purely because of the format suffix.
+        avito_core = album_core_tokens(avito_title)
+        moysklad_all = _canon(text_tokens(moysklad_name))
+        if not avito_core or not moysklad_all:
             return 0.0
-        tie = SequenceMatcher(
-            None, normalize_text(avito_title), normalize_text(moysklad_name)
+        core_score = token_coverage(avito_core, moysklad_all)
+        if core_score < ALBUM_MIN_SCORE:
+            return 0.0
+        full_similarity = SequenceMatcher(
+            None, normalize_text(_canon_text(avito_title)), normalize_text(_canon_text(moysklad_name))
         ).ratio()
-        return 0.95 * whole + 0.05 * tie
+        return 0.55 * core_score + 0.45 * full_similarity
 
     artist_score = artist_similarity(
         artist_tokens(avito_artist), artist_tokens(moysklad_artist)
@@ -539,6 +540,8 @@ class ListingReportRow:
     status: str
     match_score: float
     avito_ad_count: int = 1
+    # How many MoySklad cards (pressings) this album row covers.
+    variant_count: int = 1
 
 
 @dataclass
@@ -551,16 +554,65 @@ class ListingReport:
         return len(self.action_required) + len(self.not_listed) + len(self.unmatched)
 
 
+def same_album(left: list[str], right: list[str]) -> bool:
+    """Whether two album cores name the same record. One side may carry a
+    subtitle the other drops ("Part 2" vs "Part 2: Life"), but a differing
+    word that matters ("Vol 1" vs "Vol 2") keeps them apart."""
+    if not left or not right:
+        return False
+    short, long_ = (left, right) if len(left) <= len(right) else (right, left)
+    return token_coverage(short, long_) >= 0.9
+
+
+def group_album_variants(
+    cards: list["AssortmentCard"],
+) -> list[list["AssortmentCard"]]:
+    """Cluster the cards that are pressings of one record.
+
+    Several MoySklad cards ("... (B/W Swirl)", "... (Amazon Exclusive)") are
+    variants of a single album, while the seller runs one Avito ad for it — so
+    the ad lands on whichever variant scores best and its siblings would look
+    unlisted. Grouping compares per album instead of per card.
+
+    Clustering happens inside one artist, where the card count is small, so the
+    pairwise comparison stays cheap.
+    """
+    by_artist: dict[str, list[tuple["AssortmentCard", list[str]]]] = {}
+    for card in cards:
+        artist, rest = split_artist_album(card.name)
+        artist_key = " ".join(artist_tokens(artist)) if artist is not None else ""
+        core = album_core_tokens(rest if artist is not None else card.name)
+        by_artist.setdefault(artist_key, []).append((card, core))
+
+    groups: list[list["AssortmentCard"]] = []
+    for entries in by_artist.values():
+        buckets: list[tuple[list[str], list["AssortmentCard"]]] = []
+        for card, core in entries:
+            for index, (bucket_core, members) in enumerate(buckets):
+                if same_album(core, bucket_core):
+                    members.append(card)
+                    if core and len(core) < len(bucket_core):
+                        buckets[index] = (core, members)  # keep the plainest name
+                    break
+            else:
+                buckets.append((core, [card]))
+        groups.extend(members for _, members in buckets)
+    return groups
+
+
 def build_listing_report(
     avito_client: AvitoClient,
     cards: list["AssortmentCard"],
 ) -> ListingReport:
     active_items = avito_client.iter_active_items()
+    pending_items = avito_client.iter_pending_items()
     closed_items = avito_client.iter_closed_items()
 
     index, unparsed = build_artist_index(cards)
 
     active_hrefs: set[str] = set()
+    pending_hrefs: set[str] = set()
+    closed_hrefs: set[str] = set()
     score_by_href: dict[str, float] = {}
     unmatched_counts: dict[str, int] = {}
 
@@ -574,76 +626,64 @@ def build_listing_report(
             score_by_href.get(match.card.href, 0.0), match.score
         )
 
-    # A card whose ad is closed is the "probably sold" signal, so closed ads go
-    # through the same matcher. A miss degrades safely: the card lands in
-    # "not listed" rather than producing a false alert.
-    closed_ad_by_href: dict[str, AvitoItem] = {}
+    for item in pending_items:
+        match = match_to_assortment(item.title, index, unparsed, cards)
+        if match is not None:
+            pending_hrefs.add(match.card.href)
+
     for item in closed_items:
         match = match_to_assortment(item.title, index, unparsed, cards)
-        if match is not None and match.card.href not in closed_ad_by_href:
-            closed_ad_by_href[match.card.href] = item
-
-    # An ad that merely ran out its 30-day placement is still the seller's
-    # listing, waiting in "неопубликованные" to be re-activated — not a sale.
-    # Only the cards this would actually flag are checked, so the extra
-    # requests stay proportional to the findings rather than to ad history.
-    cutoff = datetime.now() - timedelta(days=AVITO_PENDING_REACTIVATION_DAYS)
-    pending_hrefs: set[str] = set()
-    for card in cards:
-        quantity = card.available_quantity
-        if quantity is None or quantity < 1 or card.href in active_hrefs:
-            continue
-        ad = closed_ad_by_href.get(card.href)
-        if ad is None:
-            continue
-        try:
-            finish = avito_client.item_finish_time(ad.id)
-        except AvitoError:
-            continue  # treat as unknown; the card keeps its "closed" reading
-        if finish is not None and finish >= cutoff:
-            pending_hrefs.add(card.href)
-
-    closed_hrefs = set(closed_ad_by_href) - pending_hrefs
+        if match is not None:
+            closed_hrefs.add(match.card.href)
 
     action_required: list[ListingReportRow] = []
     not_listed: list[ListingReportRow] = []
 
-    for card in cards:
-        quantity = card.available_quantity
-        is_active = card.href in active_hrefs or card.href in pending_hrefs
-        is_closed = not is_active and card.href in closed_hrefs
+    for members in group_album_variants(cards):
+        quantities = [m.available_quantity for m in members if m.available_quantity is not None]
+        quantity = sum(quantities) if quantities else None
 
-        if card.href in active_hrefs:
+        has_active = any(m.href in active_hrefs for m in members)
+        has_pending = any(m.href in pending_hrefs for m in members)
+        has_closed = any(m.href in closed_hrefs for m in members)
+        is_listed = has_active or has_pending
+
+        if has_active:
             state = AVITO_STATE_ACTIVE
-        elif card.href in pending_hrefs:
+        elif has_pending:
             state = AVITO_STATE_PENDING
-        elif is_closed:
+        elif has_closed:
             state = AVITO_STATE_CLOSED
         else:
             state = AVITO_STATE_NONE
 
+        # Shortest name is the least detail-laden, so it reads as the album.
+        representative = min(members, key=lambda m: (len(m.name), m.name))
         row = ListingReportRow(
-            name=card.name,
+            name=representative.name,
             moysklad_quantity=quantity,
             avito_state=state,
             status="",
-            match_score=score_by_href.get(card.href, 0.0),
+            match_score=max((score_by_href.get(m.href, 0.0) for m in members), default=0.0),
+            variant_count=len(members),
         )
 
         if quantity is None:
             row.status = STATUS_UNKNOWN_QUANTITY
             action_required.append(row)
-        elif is_active and quantity == 0:
+        elif has_active and quantity == 0:
+            # Only a *running* ad can take an order we cannot fill. An ad
+            # sitting in "неопубликованные" with nothing in stock needs no
+            # action — it simply will not be re-activated.
             row.status = STATUS_LISTED_NO_STOCK
             action_required.append(row)
-        elif is_closed and quantity >= 1:
+        elif (not is_listed) and has_closed and quantity >= 1:
             row.status = STATUS_MAYBE_SOLD
             action_required.append(row)
         elif state == AVITO_STATE_NONE and quantity >= 1:
             row.status = STATUS_NOT_LISTED
             not_listed.append(row)
-        # Remaining combinations are consistent (listed and in stock, or absent and
-        # out of stock) and are left out of the report entirely.
+        # Anything else is consistent and stays out of the report.
 
     unmatched = [
         ListingReportRow(
