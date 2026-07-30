@@ -27,6 +27,46 @@ without manually cross-checking both systems by hand.
   is fuzzy by title, same technique as the existing purchase-order search
   (`album_match_score`).
 
+## UPDATE 2026-07-30 — findings from the live API, after Phase 1 shipped
+
+Investigating the real Avito API invalidated two assumptions in this spec and
+unblocked Phase 2 by a different route. Read this before the sections below.
+
+**Avito exposes no quantity for this account.** Verified against the live API and
+the public site:
+
+- `GET /core/v1/items` returns only `address, category, id, price, status, title, url`.
+- `GET /core/v1/accounts/{id}/items/{item_id}` returns only
+  `start_time, finish_time, status, url, vas`.
+- `GET /autoload/v2/items/...` → **403, "автозагрузка вам недоступна. Для
+  подключения необходимо оплатить тариф"**. Avito's Autoload feed is the only
+  place its API carries a `Quantity` field, and this account lacks that tariff.
+- A live ad page contains no quantity either: the string `шт` appears zero times
+  and the page data reports `isCartEnabled: false` (a plain classified ad in
+  «Коллекционирование»). So scraping cannot recover the number — it does not exist.
+
+**"One ad = one physical copy" (recorded below as user-confirmed) does not hold in
+practice.** Of 1472 active ads covering 1467 unique normalized titles, 1463 titles
+have exactly one ad. The account lists one ad per title regardless of how many
+copies it holds. Counting ads therefore yields only 0 or 1, which is what the
+original Phase 1 report showed. Phase 1 was reframed to compare *presence on
+Avito* against *MoySklad stock* rather than two quantities.
+
+**No orders/delivery API was found**, so Phase 2's original trigger ("delivered
+order") is not available. Probed and 404: `/cpa/v1/orders`, `/cpa/v2/orders`,
+`/core/v1/orders`, `/order-management/v1/orders`, `/delivery/v1/orders`,
+`/id/v1/orders`.
+
+**Phase 2 can instead be built on a signal Phase 1 already computes.** Closed ads
+are cheaply listable (`status=old` → 1927 ads, `status=removed` → 52, together
+~12s), and the combination *MoySklad stock ≥ 1 while the matching Avito ad is
+closed* isolated 68 items on live data — exactly the "sold but nobody created the
+отгрузка" case Phase 2 exists to alert on. A periodic script can persist these by
+item, and alert once an item has been in that state for 2+ days. Caveats to design
+around: an ad can also close because its placement expired rather than because it
+sold, so the signal is a heuristic; and closed ads are matched on exact normalized
+title only (a miss degrades safely into the lower-signal "not listed" bucket).
+
 ## Known unknowns (must be resolved during implementation, not assumed)
 
 - Exact Avito API endpoint paths, OAuth2 flow details, and response field
