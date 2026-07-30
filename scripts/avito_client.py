@@ -6,6 +6,7 @@ import re
 import ssl
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -28,6 +29,13 @@ AVITO_MAX_RETRIES = 4
 AVITO_MATCH_THRESHOLD = 0.9
 AVITO_MAX_PAGES = 200
 AVITO_CLOSED_STATUSES = ("old", "removed")
+AVITO_ACCOUNTS_PATH = "/core/v1/accounts"
+AVITO_ACCOUNT_SELF_PATH = f"{AVITO_ACCOUNTS_PATH}/self"
+# Avito unpublishes an ad 30 days after it goes up. Those ads are not sold —
+# they sit in "неопубликованные" until the seller re-activates them, so they
+# still count as listed. Only an ad that expired longer ago than this is
+# treated as genuinely gone.
+AVITO_PENDING_REACTIVATION_DAYS = 45
 # Rate limits need more patience than a transient 5xx: plain 2**attempt backoff only
 # buys ~15s total, which is well short of Avito's window. Bounded so a hostile or
 # mistaken Retry-After can never park the single-threaded bot for a long stretch.
@@ -105,6 +113,7 @@ class AvitoClient:
         self.ssl_context = ssl_context
         self._token: str | None = None
         self._token_expires_at: float = 0.0
+        self._account_id: int | None = None
 
     def _fetch_token(self) -> None:
         body = urlencode(
@@ -228,6 +237,26 @@ class AvitoClient:
                 raise AvitoError(
                     f"Avito pagination exceeded {AVITO_MAX_PAGES} pages without terminating — possible API issue"
                 )
+
+    def account_id(self) -> int:
+        if self._account_id is None:
+            data = self.get(AVITO_ACCOUNT_SELF_PATH)
+            account_id = data.get("id")
+            if not isinstance(account_id, int):
+                raise AvitoError(f"Avito account response has no usable id: {list(data)}")
+            self._account_id = account_id
+        return self._account_id
+
+    def item_finish_time(self, item_id: int) -> datetime | None:
+        """When the ad's placement ends (or ended). None if unavailable."""
+        data = self.get(f"{AVITO_ACCOUNTS_PATH}/{self.account_id()}/items/{item_id}")
+        raw = data.get("finish_time")
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw))
+        except ValueError:
+            return None
 
     def iter_active_items(self) -> list[AvitoItem]:
         return self.iter_items("active")
@@ -487,6 +516,9 @@ STATUS_NO_MATCH = "Нет совпадения в МойСклад"
 STATUS_UNKNOWN_QUANTITY = "Остаток неизвестен"
 
 AVITO_STATE_ACTIVE = "активно"
+# Placement expired; sitting in "неопубликованные" awaiting re-activation.
+# Counts as listed, because the seller still holds and sells the record.
+AVITO_STATE_PENDING = "не опубликовано"
 AVITO_STATE_CLOSED = "закрыто"
 AVITO_STATE_NONE = "нет объявления"
 
@@ -545,22 +577,46 @@ def build_listing_report(
     # A card whose ad is closed is the "probably sold" signal, so closed ads go
     # through the same matcher. A miss degrades safely: the card lands in
     # "not listed" rather than producing a false alert.
-    closed_hrefs: set[str] = set()
+    closed_ad_by_href: dict[str, AvitoItem] = {}
     for item in closed_items:
         match = match_to_assortment(item.title, index, unparsed, cards)
-        if match is not None:
-            closed_hrefs.add(match.card.href)
+        if match is not None and match.card.href not in closed_ad_by_href:
+            closed_ad_by_href[match.card.href] = item
+
+    # An ad that merely ran out its 30-day placement is still the seller's
+    # listing, waiting in "неопубликованные" to be re-activated — not a sale.
+    # Only the cards this would actually flag are checked, so the extra
+    # requests stay proportional to the findings rather than to ad history.
+    cutoff = datetime.now() - timedelta(days=AVITO_PENDING_REACTIVATION_DAYS)
+    pending_hrefs: set[str] = set()
+    for card in cards:
+        quantity = card.available_quantity
+        if quantity is None or quantity < 1 or card.href in active_hrefs:
+            continue
+        ad = closed_ad_by_href.get(card.href)
+        if ad is None:
+            continue
+        try:
+            finish = avito_client.item_finish_time(ad.id)
+        except AvitoError:
+            continue  # treat as unknown; the card keeps its "closed" reading
+        if finish is not None and finish >= cutoff:
+            pending_hrefs.add(card.href)
+
+    closed_hrefs = set(closed_ad_by_href) - pending_hrefs
 
     action_required: list[ListingReportRow] = []
     not_listed: list[ListingReportRow] = []
 
     for card in cards:
         quantity = card.available_quantity
-        is_active = card.href in active_hrefs
+        is_active = card.href in active_hrefs or card.href in pending_hrefs
         is_closed = not is_active and card.href in closed_hrefs
 
-        if is_active:
+        if card.href in active_hrefs:
             state = AVITO_STATE_ACTIVE
+        elif card.href in pending_hrefs:
+            state = AVITO_STATE_PENDING
         elif is_closed:
             state = AVITO_STATE_CLOSED
         else:
