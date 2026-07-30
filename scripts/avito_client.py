@@ -52,7 +52,10 @@ AVITO_MAX_RETRY_DELAY_SECONDS = 60
 # of a name ("Del-Tones", "9-Bit").
 ARTIST_SEP = re.compile(r"\s+[-–—]\s+|\s+[-–—](?=\S)|(?<=\S)[-–—]\s+")
 BRACKETS = re.compile(r"[\(\[\{][^\)\]\}]*[\)\]\}]")
-LEADING_JUNK = re.compile(r"^[!*\s]+")
+# Leading "!"/"*" flags, plus reservation notes the seller puts in front of a
+# name ("(Диме 1) Muse - ..."). Only a bracket containing Cyrillic is dropped,
+# so an artist whose name genuinely starts in brackets survives.
+LEADING_JUNK = re.compile(r"^(?:[!*\s]+|\([^)]*[А-Яа-яЁё][^)]*\)\s*)+")
 SLASH = re.compile(r"\s+/\s+")
 
 # Dropped from the artist side only, where they join collaborators.
@@ -557,11 +560,17 @@ class ListingReport:
 def same_album(left: list[str], right: list[str]) -> bool:
     """Whether two album cores name the same record. One side may carry a
     subtitle the other drops ("Part 2" vs "Part 2: Life"), but a differing
-    word that matters ("Vol 1" vs "Vol 2") keeps them apart."""
+    word that matters ("Vol 1" vs "Vol 2") keeps them apart.
+
+    Words must match exactly here. The fuzzy scoring used for ad-to-card
+    matching is deliberately not reused: its abbreviation rule treats "muse"
+    as "museum", which would fold "Muse EP" into "Muscle Museum EP". Merging
+    two different records hides one of them from the report entirely, so this
+    stays strict and errs towards leaving them apart.
+    """
     if not left or not right:
         return False
-    short, long_ = (left, right) if len(left) <= len(right) else (right, left)
-    return token_coverage(short, long_) >= 0.9
+    return set(left) <= set(right) or set(right) <= set(left)
 
 
 def group_album_variants(
