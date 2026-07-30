@@ -33,6 +33,33 @@ By default, admin password is `1821`, regular user password is `123`.
 Admins receive importcds error alerts and can convert prices. Regular users only see
 the `Поиск по складу` button and do not receive alerts.
 
+## `Проверить количество` report
+
+Admin-only. Compares Avito listings against MoySklad stock and replies with an
+Excel file. Takes several minutes and blocks the bot while it runs.
+
+Avito listings carry **no quantity** for this account: one ad means "this title is
+listed", not "one copy in stock". The Autoload API that exposes a real `Quantity`
+field needs a paid tariff, and the public ad pages show no quantity either. So the
+report compares *presence on Avito* against *MoySklad stock*, not two quantities.
+
+Sheets:
+
+- `Проверить` - needs action:
+  - `Вероятно продано, нет отгрузки` - stock in MoySklad, but the Avito ad is
+    closed. Usually means it sold on Avito and nobody created the shipment
+    (отгрузка) in MoySklad. A heuristic: an ad can also close because its
+    placement expired.
+  - `На Avito, но склад 0` - ad is still running while MoySklad shows nothing left.
+  - `Остаток неизвестен` - MoySklad returned no quantity for the item.
+- `Не выставлено` - in stock, never had an Avito ad. Informational.
+- `Без совпадения` - active Avito ads whose titles matched no MoySklad item
+  (there is no shared SKU, so matching is by title). Worth reviewing for naming
+  drift between the two systems.
+
+Items that are consistent (listed and in stock, or absent and out of stock) are left
+out of the file.
+
 ## Run Telegram bot locally
 
 ```bash

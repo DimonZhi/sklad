@@ -25,6 +25,12 @@ AVITO_TIMEOUT_SECONDS = 60
 AVITO_MAX_RETRIES = 4
 AVITO_MATCH_THRESHOLD = 0.9
 AVITO_MAX_PAGES = 200
+AVITO_CLOSED_STATUSES = ("old", "removed")
+# Rate limits need more patience than a transient 5xx: plain 2**attempt backoff only
+# buys ~15s total, which is well short of Avito's window. Bounded so a hostile or
+# mistaken Retry-After can never park the single-threaded bot for a long stretch.
+AVITO_RATE_LIMIT_BASE_DELAY_SECONDS = 5
+AVITO_MAX_RETRY_DELAY_SECONDS = 60
 
 
 class AvitoError(RuntimeError):
@@ -135,8 +141,13 @@ class AvitoClient:
                 if error.code == 429 or 500 <= error.code < 600:
                     if attempt < AVITO_MAX_RETRIES:
                         retry_after = error.headers.get("Retry-After")
-                        delay = int(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
-                        time.sleep(delay)
+                        if retry_after and retry_after.isdigit():
+                            delay = int(retry_after)
+                        elif error.code == 429:
+                            delay = AVITO_RATE_LIMIT_BASE_DELAY_SECONDS * 2**attempt
+                        else:
+                            delay = 2**attempt
+                        time.sleep(min(delay, AVITO_MAX_RETRY_DELAY_SECONDS))
                         continue
                 raise AvitoError(f"Avito HTTP {error.code}: {parse_avito_error(text)}") from error
             except URLError as error:
@@ -149,13 +160,13 @@ class AvitoClient:
 
         raise AvitoError("Avito request failed after retries")
 
-    def iter_active_items(self) -> list[AvitoItem]:
+    def iter_items(self, status: str) -> list[AvitoItem]:
         items: list[AvitoItem] = []
         page = 1
         while True:
             data = self.get(
                 AVITO_ITEMS_PATH,
-                {"page": page, "per_page": AVITO_ITEMS_PER_PAGE, "status": "active"},
+                {"page": page, "per_page": AVITO_ITEMS_PER_PAGE, "status": status},
             )
             resources = data.get("resources")
             if not isinstance(resources, list):
@@ -184,6 +195,18 @@ class AvitoClient:
                 raise AvitoError(
                     f"Avito pagination exceeded {AVITO_MAX_PAGES} pages without terminating — possible API issue"
                 )
+
+    def iter_active_items(self) -> list[AvitoItem]:
+        return self.iter_items("active")
+
+    def iter_closed_items(self) -> list[AvitoItem]:
+        # "old" = placement expired, "removed" = deleted by the seller. Either way the
+        # ad existed and no longer runs, which is what distinguishes "was listed and is
+        # now gone" from "never listed at all".
+        items: list[AvitoItem] = []
+        for status in AVITO_CLOSED_STATUSES:
+            items.extend(self.iter_items(status))
+        return items
 
 
 @dataclass
@@ -219,28 +242,58 @@ def match_to_assortment(
     return AssortmentMatch(card=best_card, score=best_score)
 
 
-STATUS_OK = "OK"
-STATUS_MISMATCH = "MISMATCH"
-STATUS_NO_MATCH = "NO_CONFIDENT_MATCH"
+# Avito listings here carry no quantity: one ad means "this title is listed", not
+# "one copy in stock" (the Autoload API that would expose a real Quantity field
+# requires a paid tariff this account does not have, and the public ad pages show no
+# quantity either). So the report compares presence on Avito against MoySklad stock
+# instead of comparing two quantities.
+STATUS_MAYBE_SOLD = "Вероятно продано, нет отгрузки"
+STATUS_LISTED_NO_STOCK = "На Avito, но склад 0"
+STATUS_NOT_LISTED = "Не выставлено на Avito"
+STATUS_NO_MATCH = "Нет совпадения в МойСклад"
+STATUS_UNKNOWN_QUANTITY = "Остаток неизвестен"
+
+AVITO_STATE_ACTIVE = "активно"
+AVITO_STATE_CLOSED = "закрыто"
+AVITO_STATE_NONE = "нет объявления"
+
+# Order the actionable sheet puts statuses in — the sold-but-not-shipped cases are
+# the ones worth acting on first.
+_ACTION_STATUS_ORDER = (
+    STATUS_MAYBE_SOLD,
+    STATUS_LISTED_NO_STOCK,
+    STATUS_UNKNOWN_QUANTITY,
+)
 
 
 @dataclass
-class QuantityDiffRow:
-    avito_title: str
-    matched_name: str | None
-    match_score: float
-    avito_active_count: int
+class ListingReportRow:
+    name: str
     moysklad_quantity: Decimal | None
+    avito_state: str
     status: str
+    match_score: float
+    avito_ad_count: int = 1
 
 
-def build_quantity_diff_rows(
+@dataclass
+class ListingReport:
+    action_required: list[ListingReportRow]
+    not_listed: list[ListingReportRow]
+    unmatched: list[ListingReportRow]
+
+    def total_rows(self) -> int:
+        return len(self.action_required) + len(self.not_listed) + len(self.unmatched)
+
+
+def build_listing_report(
     avito_client: AvitoClient,
     cards: list["AssortmentCard"],
-) -> list[QuantityDiffRow]:
+) -> ListingReport:
     from telegram_price_bot import normalize_text
 
-    avito_items = avito_client.iter_active_items()
+    active_items = avito_client.iter_active_items()
+    closed_items = avito_client.iter_closed_items()
 
     exact_index: dict[str, "AssortmentCard"] = {}
     for card in cards:
@@ -248,55 +301,87 @@ def build_quantity_diff_rows(
         if key and key not in exact_index:
             exact_index[key] = card
 
-    avito_count_by_href: dict[str, int] = {}
-    match_score_by_href: dict[str, float] = {}
+    active_hrefs: set[str] = set()
+    score_by_href: dict[str, float] = {}
     unmatched_counts: dict[str, int] = {}
 
-    for item in avito_items:
+    for item in active_items:
         match = match_to_assortment(item.title, cards, exact_index)
         if match is None:
             unmatched_counts[item.title] = unmatched_counts.get(item.title, 0) + 1
             continue
+        active_hrefs.add(match.card.href)
+        score_by_href[match.card.href] = max(
+            score_by_href.get(match.card.href, 0.0), match.score
+        )
 
-        href = match.card.href
-        avito_count_by_href[href] = avito_count_by_href.get(href, 0) + 1
-        match_score_by_href[href] = max(match_score_by_href.get(href, 0.0), match.score)
+    # Closed ads are matched on exact normalized title only, not the full fuzzy scan:
+    # this is a cheap refinement over thousands of extra ads, and a miss degrades
+    # safely (the card lands in "not listed" rather than producing a false alert).
+    closed_titles: set[str] = set()
+    for item in closed_items:
+        key = normalize_text(item.title)
+        if key:
+            closed_titles.add(key)
 
-    rows: list[QuantityDiffRow] = []
+    action_required: list[ListingReportRow] = []
+    not_listed: list[ListingReportRow] = []
+
     for card in cards:
-        avito_count = avito_count_by_href.get(card.href, 0)
-        moysklad_quantity = card.available_quantity
-        if avito_count == 0 and (moysklad_quantity is None or moysklad_quantity == 0):
-            continue
+        quantity = card.available_quantity
+        is_active = card.href in active_hrefs
+        is_closed = not is_active and normalize_text(card.name) in closed_titles
 
-        quantities_match = moysklad_quantity is not None and moysklad_quantity == avito_count
-        rows.append(
-            QuantityDiffRow(
-                avito_title=card.name,
-                matched_name=card.name,
-                match_score=match_score_by_href.get(card.href, 0.0),
-                avito_active_count=avito_count,
-                moysklad_quantity=moysklad_quantity,
-                status=STATUS_OK if quantities_match else STATUS_MISMATCH,
-            )
+        if is_active:
+            state = AVITO_STATE_ACTIVE
+        elif is_closed:
+            state = AVITO_STATE_CLOSED
+        else:
+            state = AVITO_STATE_NONE
+
+        row = ListingReportRow(
+            name=card.name,
+            moysklad_quantity=quantity,
+            avito_state=state,
+            status="",
+            match_score=score_by_href.get(card.href, 0.0),
         )
 
-    for title, count in unmatched_counts.items():
-        rows.append(
-            QuantityDiffRow(
-                avito_title=title,
-                matched_name=None,
-                match_score=0.0,
-                avito_active_count=count,
-                moysklad_quantity=None,
-                status=STATUS_NO_MATCH,
-            )
-        )
+        if quantity is None:
+            row.status = STATUS_UNKNOWN_QUANTITY
+            action_required.append(row)
+        elif is_active and quantity == 0:
+            row.status = STATUS_LISTED_NO_STOCK
+            action_required.append(row)
+        elif is_closed and quantity >= 1:
+            row.status = STATUS_MAYBE_SOLD
+            action_required.append(row)
+        elif state == AVITO_STATE_NONE and quantity >= 1:
+            row.status = STATUS_NOT_LISTED
+            not_listed.append(row)
+        # Remaining combinations are consistent (listed and in stock, or absent and
+        # out of stock) and are left out of the report entirely.
 
-    rows.sort(
-        key=lambda row: (
-            row.status == STATUS_OK,
-            row.avito_title.lower(),
+    unmatched = [
+        ListingReportRow(
+            name=title,
+            moysklad_quantity=None,
+            avito_state=AVITO_STATE_ACTIVE,
+            status=STATUS_NO_MATCH,
+            match_score=0.0,
+            avito_ad_count=count,
         )
+        for title, count in unmatched_counts.items()
+    ]
+
+    action_required.sort(
+        key=lambda row: (_ACTION_STATUS_ORDER.index(row.status), row.name.lower())
     )
-    return rows
+    not_listed.sort(key=lambda row: row.name.lower())
+    unmatched.sort(key=lambda row: row.name.lower())
+
+    return ListingReport(
+        action_required=action_required,
+        not_listed=not_listed,
+        unmatched=unmatched,
+    )

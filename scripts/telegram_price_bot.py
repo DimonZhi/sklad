@@ -24,7 +24,14 @@ from urllib.request import Request, urlopen
 
 from openpyxl import Workbook
 
-from avito_client import AvitoClient, AvitoError, QuantityDiffRow, build_quantity_diff_rows
+from avito_client import (
+    AvitoClient,
+    AvitoError,
+    ListingReport,
+    STATUS_LISTED_NO_STOCK,
+    STATUS_MAYBE_SOLD,
+    build_listing_report,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -1053,30 +1060,57 @@ def build_purchase_report_workbook(rows: list[PurchaseReportRow]) -> bytes:
     return buffer.getvalue()
 
 
-def build_quantity_diff_workbook(rows: list[QuantityDiffRow]) -> bytes:
+def build_listing_report_workbook(report: ListingReport) -> bytes:
     workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Проверка количества"
-    sheet.append(
-        ["Название", "Кол-во на Avito", "Кол-во в МойСклад", "Статус", "Уверенность совпадения"]
+
+    action_sheet = workbook.active
+    action_sheet.title = "Проверить"
+    action_sheet.append(
+        ["Название", "Остаток МойСклад", "Объявление Avito", "Что не так", "Совпадение"]
     )
-    for row in rows:
-        moysklad_quantity = (
-            float(row.moysklad_quantity) if row.moysklad_quantity is not None else "неизвестно"
-        )
-        sheet.append(
+    for row in report.action_required:
+        action_sheet.append(
             [
-                row.avito_title,
-                row.avito_active_count,
-                moysklad_quantity,
+                row.name,
+                float(row.moysklad_quantity) if row.moysklad_quantity is not None else "неизвестно",
+                row.avito_state,
                 row.status,
                 round(row.match_score, 3),
             ]
         )
 
+    not_listed_sheet = workbook.create_sheet("Не выставлено")
+    not_listed_sheet.append(["Название", "Остаток МойСклад"])
+    for row in report.not_listed:
+        not_listed_sheet.append(
+            [
+                row.name,
+                float(row.moysklad_quantity) if row.moysklad_quantity is not None else "неизвестно",
+            ]
+        )
+
+    unmatched_sheet = workbook.create_sheet("Без совпадения")
+    unmatched_sheet.append(["Заголовок объявления на Avito", "Активных объявлений"])
+    for row in report.unmatched:
+        unmatched_sheet.append([row.name, row.avito_ad_count])
+
     buffer = BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
+
+
+def listing_report_caption(report: ListingReport) -> str:
+    maybe_sold = sum(1 for row in report.action_required if row.status == STATUS_MAYBE_SOLD)
+    listed_no_stock = sum(
+        1 for row in report.action_required if row.status == STATUS_LISTED_NO_STOCK
+    )
+    return (
+        f"Требует проверки: {len(report.action_required)}\n"
+        f"- вероятно продано, нет отгрузки: {maybe_sold}\n"
+        f"- на Avito, но склад 0: {listed_no_stock}\n"
+        f"Не выставлено на Avito: {len(report.not_listed)}\n"
+        f"Без совпадения в МойСклад: {len(report.unmatched)}"
+    )
 
 
 def split_telegram_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
@@ -1386,10 +1420,13 @@ def handle_message(
             )
             return
 
-        telegram.send_message(chat_id, "Проверяю количество в Avito и МойСклад...")
+        telegram.send_message(
+            chat_id,
+            "Сверяю объявления Avito с остатками МойСклад. Это займет несколько минут...",
+        )
         try:
             cards = load_assortment_cards(moysklad)
-            rows = build_quantity_diff_rows(avito, cards)
+            report = build_listing_report(avito, cards)
         except (MoySkladError, AvitoError, BotError) as error:
             telegram.send_message(
                 chat_id,
@@ -1398,7 +1435,7 @@ def handle_message(
             )
             return
 
-        if not rows:
+        if report.total_rows() == 0:
             telegram.send_message(
                 chat_id,
                 "Расхождений не найдено.",
@@ -1406,13 +1443,13 @@ def handle_message(
             )
             return
 
-        workbook_bytes = build_quantity_diff_workbook(rows)
+        workbook_bytes = build_listing_report_workbook(report)
         telegram.send_document(
             chat_id,
             filename=f"quantity_check_{datetime.now():%Y%m%d_%H%M}.xlsx",
             file_bytes=workbook_bytes,
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            caption=f"Проверено позиций: {len(rows)}",
+            caption=listing_report_caption(report),
             reply_markup=main_keyboard(role),
         )
         return
