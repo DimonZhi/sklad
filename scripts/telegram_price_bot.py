@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from difflib import SequenceMatcher
+from http.client import HTTPException
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -428,13 +429,17 @@ class MoySkladClient:
 
                 message = parse_api_error(text)
                 raise MoySkladError(f"HTTP {error.code}: {message}") from error
-            except URLError as error:
+            except json.JSONDecodeError as error:
+                raise MoySkladError(f"API returned invalid JSON from {url}") from error
+            except (URLError, HTTPException, OSError) as error:
+                # A dropped connection arrives as RemoteDisconnected, not
+                # URLError, and used to escape this loop and abort whatever
+                # the bot was doing.
                 if attempt < MAX_RETRIES:
                     time.sleep(2**attempt)
                     continue
-                raise MoySkladError(f"Network error: {error.reason}") from error
-            except json.JSONDecodeError as error:
-                raise MoySkladError(f"API returned invalid JSON from {url}") from error
+                reason = getattr(error, "reason", error)
+                raise MoySkladError(f"Network error: {reason}") from error
 
         raise MoySkladError("Request failed after retries")
 
@@ -1072,7 +1077,6 @@ def build_listing_report_workbook(report: ListingReport) -> bytes:
             "Объявление Avito",
             "Что не так",
             "Совпадение",
-            "Вариантов в МойСклад",
         ]
     )
     for row in report.action_required:
@@ -1083,7 +1087,6 @@ def build_listing_report_workbook(report: ListingReport) -> bytes:
                 row.avito_state,
                 row.status,
                 round(row.match_score, 3),
-                row.variant_count,
             ]
         )
 
