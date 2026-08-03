@@ -84,10 +84,7 @@ ALBUM_MIN_SCORE = 0.80
 # it needs an ad.
 MATCH_MIN_SCORE = 0.85
 # How many cards an ad may fall back to when its best one is already taken.
-MATCH_CANDIDATES_PER_AD = 5
-# Nudge towards a card that is actually in stock when the text cannot separate
-# two pressings. Sized to the noise in the whole-title similarity term.
-STOCK_PREFERENCE_BONUS = 0.05
+MATCH_CANDIDATES_PER_AD = 8
 
 
 class AvitoError(RuntimeError):
@@ -388,6 +385,21 @@ def token_coverage(needles, haystack) -> float:
     return sum(max(token_similarity(n, h) for h in haystack) for n in needles) / len(needles)
 
 
+def album_prefix_match(left, right) -> bool:
+    """Whether one album name simply continues the other.
+
+    A subtitle or bonus disc extends the name without changing the record:
+    "The Story So Far" and "The Story So Far: The Best Of", or "Shadow of the
+    Moon" and "Shadow of the Moon 7\"". Requiring a prefix rather than plain
+    containment is what keeps "Babymetal" apart from "10 Babymetal Years",
+    where the shared word sits in the middle of a different title.
+    """
+    if not left or not right:
+        return False
+    short, long_ = (left, right) if len(left) <= len(right) else (right, left)
+    return all(token_similarity(s, l) >= 0.9 for s, l in zip(short, long_))
+
+
 def artist_similarity(left: list[str], right: list[str]) -> float:
     if not left or not right:
         return 0.0
@@ -463,7 +475,13 @@ def score_pair(avito_title: str, moysklad_name: str) -> float:
     moysklad_all = _canon(text_tokens(moysklad_rest))
     album_score = token_coverage(avito_album, moysklad_all or moysklad_album)
     if album_score < ALBUM_MIN_SCORE:
-        return 0.0
+        # The ad can also be *more* descriptive than the card — naming a bonus
+        # disc or a subtitle the card omits — which the coverage above reads as
+        # words the card is missing. Accept it when one name simply continues
+        # the other, at the floor so a fuller match still outranks it.
+        if not album_prefix_match(avito_album, moysklad_album):
+            return 0.0
+        album_score = ALBUM_MIN_SCORE
 
     # Details (colour, pressing, "signed") separate one pressing from another,
     # so they carry the tiebreak. Asymmetric on purpose: what the AD states
@@ -562,7 +580,7 @@ def _match_one(
     scored: list[AssortmentMatch] = []
     for card in candidates:
         score = score_pair(title, card.name)
-        if score >= MATCH_MIN_SCORE:
+        if score > 0.0:
             scored.append(AssortmentMatch(card=card, score=score))
     scored.sort(key=lambda m: -m.score)
     return scored[:MATCH_CANDIDATES_PER_AD]
@@ -595,7 +613,45 @@ def match_to_assortment(
     token_index: dict[str, list["AssortmentCard"]],
 ) -> AssortmentMatch | None:
     ranked = rank_matches(title, index, unparsed, cards, token_index)
+    ranked = [match for match in ranked if match.score >= MATCH_MIN_SCORE]
     return ranked[0] if ranked else None
+
+
+def _album_tokens_of(name: str) -> tuple[str, ...]:
+    artist, rest = split_artist_album(name)
+    return album_core_tokens(rest if artist is not None else name)
+
+
+def prefer_stocked_variant(ranked: list[AssortmentMatch]) -> list[AssortmentMatch]:
+    """Put an in-stock pressing first when the wording does not settle it.
+
+    An exact title tells us exactly which pressing the ad is for. Anything less
+    is the ad naming the record but not the variant, and then the pressing the
+    seller actually holds is the better answer than whichever card happens to
+    read closest — "Shadow of the Moon (Black)", one in stock, over
+    "(Clear 2LP+7\")", none, when the ad says only "Shadow of the Moon".
+    """
+    if not ranked or ranked[0].score >= 1.0:
+        return ranked
+
+    def has_stock(match: AssortmentMatch) -> bool:
+        quantity = match.card.available_quantity
+        return quantity is not None and quantity > 0
+
+    if has_stock(ranked[0]):
+        return ranked
+
+    leader = _album_tokens_of(ranked[0].card.name)
+    stocked = [
+        match
+        for match in ranked[1:]
+        if has_stock(match) and album_prefix_match(leader, _album_tokens_of(match.card.name))
+    ]
+    if not stocked:
+        return ranked
+
+    best = max(stocked, key=lambda match: match.score)
+    return [best] + [match for match in ranked if match is not best]
 
 
 def assign_ads(
@@ -609,31 +665,28 @@ def assign_ads(
 
     The seller runs one ad per item, so letting a single ad mark several cards
     as listed hides the ones that genuinely need an ad — "Imagine (Limited
-    Edition 2LP)" would otherwise also cover the plain "Imagine". Proposals are
-    taken best-score-first, which lets the most specific ad win the card it
-    describes before a vaguer one can take it.
+    Edition 2LP)" would otherwise also cover the plain "Imagine".
+
+    Ads are served best-match-first so the most specific ad wins the card it
+    describes before a vaguer one can take it. Within one ad the order set by
+    `prefer_stocked_variant` is preserved, which a plain sort on score would
+    otherwise undo.
 
     Returns (score by claimed card href, ads that claimed nothing).
     """
-    proposals: list[tuple[float, int, "AssortmentCard"]] = []
+    proposals: list[tuple[float, float, int, "AssortmentCard"]] = []
     for position, item in enumerate(items):
-        for match in rank_matches(item.title, index, unparsed, cards, token_index):
-            proposals.append((match.score, position, match.card))
-    def preference(proposal: tuple[float, int, "AssortmentCard"]) -> float:
-        score, _, card = proposal
-        has_stock = card.available_quantity is not None and card.available_quantity > 0
-        return score + (STOCK_PREFERENCE_BONUS if has_stock else 0.0)
-
-    # When an ad names no pressing, the text alone separates the candidates only
-    # by how much trailing detail each card happens to carry — "(B/W Swirl)"
-    # beat "(Amazon Exclusive)" purely for being shorter. Stock is the better
-    # signal: a live ad is far more likely to be for a record the seller holds.
-    # The bonus is sized to noise, so a clearly better text match still wins.
-    proposals.sort(key=lambda proposal: -preference(proposal))
+        ranked = rank_matches(item.title, index, unparsed, cards, token_index)
+        if not any(match.score >= MATCH_MIN_SCORE for match in ranked):
+            continue
+        quality = max(match.score for match in ranked)
+        for rank, match in enumerate(prefer_stocked_variant(ranked)):
+            proposals.append((quality - rank * 0.001, match.score, position, match.card))
+    proposals.sort(key=lambda proposal: -proposal[0])
 
     claimed: dict[str, float] = {}
     used_positions: set[int] = set()
-    for score, position, card in proposals:
+    for _, score, position, card in proposals:
         if position in used_positions or card.href in claimed:
             continue
         used_positions.add(position)
@@ -641,6 +694,7 @@ def assign_ads(
 
     unclaimed = [item for position, item in enumerate(items) if position not in used_positions]
     return claimed, unclaimed
+
 
 
 # Avito listings here carry no quantity: one ad means "this title is listed", not
